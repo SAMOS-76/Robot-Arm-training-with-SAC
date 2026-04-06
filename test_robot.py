@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import mujoco
 
 from SAC_agent import ActorNetwork, CNNEncoder
-from s0_100_env import S0100Env
+from stack_block_env import S0100Env
 
 try:
     import cv2  # type: ignore
@@ -73,7 +73,7 @@ def build_fused_obs(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate and view a trained SAC robot-arm policy.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Actor checkpoint path. If omitted, newest checkpoint in models/SAC is used.")
-    parser.add_argument("--models-dir", type=str, default="models/SAC", help="Directory containing numeric checkpoint files.")
+    parser.add_argument("--models-dir", type=str, default="models/SAC_stacking/Actor", help="Directory containing numeric checkpoint files.")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to run.")
     parser.add_argument("--max-steps", type=int, default=250, help="Max steps per evaluation episode.")
     parser.add_argument("--deterministic", dest="deterministic", action="store_true", help="Use tanh(mean) action instead of sampling.")
