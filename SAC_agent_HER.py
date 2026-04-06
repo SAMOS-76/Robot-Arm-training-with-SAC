@@ -230,158 +230,14 @@ class SACAgent():
 
         return actor_loss.item(), alpha_loss.item()
 
-    # def train(self, model_path, save_timesteps = 20000):
-    #     # Kinda need to clean this up...
-    #     n_envs = self.env.num_envs
-    #     episode_rewards = np.zeros(n_envs)
-    #     episode_returns = []
-    #     episode_count = 0
-    #     tau = 0.005
+    def sample(self, buffer):
+        batch = random.sample(buffer, k=self.batch_size)
+        obs_raw_, actions_, rewards_, next_obs_raw_, dones_, episode_ids_, episode_timesteps_ = zip(*batch)
 
-    #     # Episode data logging
-    #     success_history = deque(maxlen=100)
-    #     final_distance_history = deque(maxlen=100)
-
-    #     # Replay buffer
-    #     buffer = deque(maxlen=self.replay_size)
-
-    #     # In training loop, I repeatedly fuse observations since I store the raw observations into the replay buffer
-    #     # Need to research better way
-
-    #     raw_obs, _ = self.env.reset()
-    #     with torch.no_grad():
-    #         fused_obs = self.fuse_observations(raw_obs, detach_encoder=True)
-
-    #     for global_step in range(self.total_timesteps):
-    #         # Get next action for current state in the episode
-    #         with torch.no_grad():
-    #             mean, log_sd = self.Actor(fused_obs)
-    #             sd = log_sd.exp()
-    #             normal = Normal(mean, sd)
-    #             x = normal.rsample()
-    #             action = torch.tanh(x)
-    #             actions_np = action.cpu().numpy()
-
-    #         raw_next_obs, reward, terminated, truncated, infos = self.env.step(actions_np)
-    #         with torch.no_grad():
-    #             fused_next_obs = self.fuse_observations(raw_next_obs)
-
-    #         # done if either terminated or truncated
-    #         dones = np.logical_or(terminated, truncated)
-    #         episode_rewards += reward
-
-    #         # Info for each timestep
-    #         step_success = np.full(n_envs, np.nan, dtype=np.float32)
-    #         step_distance = np.full(n_envs, np.nan, dtype=np.float32)
-
-    #         if "success" in infos:
-    #             step_success = np.asarray(infos["success"], dtype=np.float32)
-
-    #         if "distance" in infos:
-    #             step_distance = np.asarray(infos["distance"], dtype=np.float32)
-
-    #         if "final_info" in infos and "_final_info" in infos:
-    #             final_infos = infos["final_info"]
-    #             final_mask = infos["_final_info"]
-    #             for i in range(n_envs):
-    #                 if final_mask[i] and final_infos[i] is not None:
-    #                     final_info = final_infos[i]
-    #                     if "success" in final_info:
-    #                         step_success[i] = 1.0 if bool(final_info["success"]) else 0.0
-    #                     if "distance" in final_info:
-    #                         step_distance[i] = float(final_info["distance"])
-
-    #         # Get states from all vectorised environments and append to replay buffer
-    #         for i in range(n_envs):
-    #             obs = {
-    #                 "image": raw_obs["image"][i].copy(),
-    #                 "joints": raw_obs["joints"][i].astype(np.float32, copy=True),
-    #             }
-    #             next_obs = {
-    #                 "image": raw_next_obs["image"][i].copy(),
-    #                 "joints": raw_next_obs["joints"][i].astype(np.float32, copy=True),
-    #             }
-
-    #             if "final_observation" in infos and infos.get("_final_observation", [False] * n_envs)[i]:
-    #                 final_obs = infos["final_observation"][i]
-    #                 next_obs = {
-    #                     "image": final_obs["image"].copy(),
-    #                     "joints": final_obs["joints"].astype(np.float32, copy=True),
-    #                 }
-
-    #             buffer.append((obs, actions_np[i], reward[i], next_obs, dones[i]))
-
-    #         for i in range(n_envs):
-    #             if dones[i]:
-    #                 ret = float(episode_rewards[i])
-    #                 episode_returns.append(ret)
-    #                 episode_count += 1
-
-    #                 success_i = step_success[i]
-    #                 if np.isnan(success_i):
-    #                     success_i = 1.0 if terminated[i] else 0.0
-    #                 success_history.append(float(success_i))
-
-    #                 dist_i = step_distance[i]
-    #                 if not np.isnan(dist_i):
-    #                     final_distance_history.append(float(dist_i))
-
-    #                 # Get average returns successes and distances and print them
-    #                 ret10 = float(np.mean(episode_returns[-10:])) if len(episode_returns) >= 1 else float("nan")
-    #                 succ100 = float(np.mean(success_history)) if len(success_history) > 0 else float("nan")
-    #                 dist100 = float(np.mean(final_distance_history)) if len(final_distance_history) > 0 else float("nan")
-
-    #                 print(
-    #                     f"step={global_step + i}, episode={episode_count}, "
-    #                     f"episode_return={ret:.3f}, return10={ret10:.3f}, "
-    #                     f"success100={succ100:.3f}, final_dist100={dist100:.4f}"
-    #                 )
-
-    #                 episode_rewards[i] = 0.0
-
-    #         # Training
-    #         if len(buffer) > self.learning_steps: # Let buffer fill up before learning
-    #             batch = random.sample(buffer, k=self.batch_size)
-    #             obs_raw_, actions_, rewards_, next_obs_raw_, dones_ = zip(*batch)
-
-    #             obs_batch = {
-    #                 "image": np.stack([o["image"] for o in obs_raw_], axis=0),
-    #                 "joints": np.stack([o["joints"] for o in obs_raw_], axis=0),
-    #             }
-    #             next_obs_batch = {
-    #                 "image": np.stack([o["image"] for o in next_obs_raw_], axis=0),
-    #                 "joints": np.stack([o["joints"] for o in next_obs_raw_], axis=0),
-    #             }
-
-    #             # Convert numpy values to tensors
-    #             tensor_obs = self.fuse_observations(obs_batch, detach_encoder=False)
-    #             tensor_next_obs = self.fuse_observations(next_obs_batch, detach_encoder=False)
-    #             tensor_actions = torch.as_tensor(np.array(actions_), dtype=torch.float32, device=self.device)
-    #             tensor_reward = torch.as_tensor(np.array(rewards_), dtype=torch.float32, device=self.device).view(-1, 1)
-    #             tensor_dones = torch.as_tensor(np.array(dones_), dtype=torch.float32, device=self.device).view(-1, 1)
-
-    #             # Training Critic
-    #             self.update_critic(tensor_next_obs, tensor_obs, tensor_actions, tensor_reward, tensor_dones)
-
-    #             # Train Actor: need to compare to newly updated critic
-    #             self.update_actor(tensor_obs.detach())
-
-    #             # Soft update the TargetCritic 
-    #             for target_param, local_param in zip(self.TargetCritic.parameters(), self.Critic.parameters()):
-    #                 target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+        # Change 80% to HER (seems to be the standard)
+        HER_elements = np.random.choice(self.batch_size, size=int(self.batch_size*0.8), replace=False)
+        for i in HER_elements:
             
-    #         raw_obs = raw_next_obs
-    #         fused_obs = fused_next_obs.detach()
-
-    #         # Save model after certain amout of timesteps
-    #         if global_step % save_timesteps == 0:
-    #             torch.save(self.Actor.state_dict(), f"{model_path}/{global_step}")
-
-    #         # End after last 10 episodes have succeded
-    #         if len(episode_returns) > 10 and np.mean(episode_returns[-10:]) >= 0:
-    #             print("max reward achieved")
-    #             torch.save(self.Actor.state_dict(), f"{model_path}/{global_step}")
-    #             break
 
     def train(self, model_path, save_timesteps=50000):
         start_time = time.time()
@@ -390,6 +246,9 @@ class SACAgent():
         episode_rewards = np.zeros(n_envs)
         episode_returns = []
         episode_count = 0
+        env_episode_ids = np.arange(n_envs, dtype=np.int32)
+        env_episode_timesteps = np.zeros(n_envs, dtype=np.int32)
+        next_episode_id = n_envs
         tau = 0.005
 
         # Episode data logging
@@ -476,15 +335,15 @@ class SACAgent():
                     "image": raw_next_obs["image"][i].copy(),
                     "joints": raw_next_obs["joints"][i].astype(np.float32, copy=True),
                 }
-
                 if "final_observation" in infos and infos.get("_final_observation", [False] * n_envs)[i]:
                     final_obs = infos["final_observation"][i]
                     next_obs = {
                         "image": final_obs["image"].copy(),
                         "joints": final_obs["joints"].astype(np.float32, copy=True),
                     }
-                
-                buffer.append((obs, actions_np[i], reward[i], next_obs, dones[i]))
+                buffer.append((obs, actions_np[i], reward[i], next_obs, dones[i], env_episode_ids[i], env_episode_timesteps[i]))
+
+            env_episode_timesteps += 1
 
             for i in range(n_envs):
                 if dones[i]:
@@ -529,10 +388,14 @@ class SACAgent():
                         f"{'-'*75}"
                     )
 
+                    env_episode_ids[i] = next_episode_id
+                    next_episode_id += 1
+                    env_episode_timesteps[i] = 0
+
             # Training
             if len(buffer) > self.learning_steps: # Let buffer fill up before learning
                 batch = random.sample(buffer, k=self.batch_size)
-                obs_raw_, actions_, rewards_, next_obs_raw_, dones_ = zip(*batch)
+                obs_raw_, actions_, rewards_, next_obs_raw_, dones_, episode_ids_, episode_timesteps_ = zip(*batch)
 
                 obs_batch = {
                     "image": np.stack([o["image"] for o in obs_raw_], axis=0),

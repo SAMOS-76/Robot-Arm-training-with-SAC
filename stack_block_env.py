@@ -193,15 +193,16 @@ class S0100Env(MujocoEnv):
         joint_obs = np.concatenate([
             joint_positions,             
             joint_velocities,             
-            tip_pos,                
+            tip_pos,     
             red_block_pos,        
-            blue_block_pos,       
-            target_bottom_pos,   
-            target_top_pos,       
+            blue_block_pos,                       
             vec_gripper_to_red,   
             vec_red_to_target,    
             vec_gripper_to_blue,  
-            vec_blue_to_target    
+            vec_blue_to_target,
+            # My goals for HER
+            target_bottom_pos,   
+            target_top_pos
         ]).astype(np.float32)
 
         if self.obs_type == "state":
