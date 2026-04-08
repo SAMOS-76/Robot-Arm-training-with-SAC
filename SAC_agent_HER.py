@@ -9,7 +9,9 @@ from torch import nn
 from torch import optim
 from torch.distributions import Normal
 from torch.optim.lr_scheduler import LinearLR
-from collections import deque
+from collections import deque, namedtuple
+
+StepInfo = namedtuple('StepInfo', ['obs_raw', 'action', 'reward', 'next_obs_raw', 'done'])
 
 # Actor takes in current state and produces mean and standard deviation of a normal distribution
 class ActorNetwork(nn.Module):
@@ -105,6 +107,7 @@ class SACAgent():
         self.env = env
         self.device = device
         self.total_timesteps = timesteps
+        self.replay_buffer = GlobalEpisodicReplayBuffer(max_episodes=1000)
 
         # Hyperparameters
         self.critic_learning_rate = 0.0003
@@ -230,14 +233,23 @@ class SACAgent():
 
         return actor_loss.item(), alpha_loss.item()
 
-    def sample(self, buffer):
-        batch = random.sample(buffer, k=self.batch_size)
-        obs_raw_, actions_, rewards_, next_obs_raw_, dones_, episode_ids_, episode_timesteps_ = zip(*batch)
+    def sample(self):
+        batch = random.sample(self.replay_buffer, k=self.batch_size)
 
         # Change 80% to HER (seems to be the standard)
         HER_elements = np.random.choice(self.batch_size, size=int(self.batch_size*0.8), replace=False)
         for i in HER_elements:
-            
+            episode_length = self.replay_buffer.episode_lengths[i]
+            step = random.randint(0, episode_length-1)
+            future_step = random.randint(step+1, episode_length-1)
+            current_obs = self.replay_buffer[i][step].obs_raw
+            current_goal = current_obs["joints"][-6:]
+            current_gripper_pos = current_obs["joints"][-15:-12]
+            future_obs = self.replay_buffer[i][future_step].obs_raw
+            future_goal = future_obs["joints"][-12:-6]
+            self.replay_buffer[i][step].obs_raw["joints"][-6:] = future_goal
+
+            self.replay_buffer[i][step].reward = self.env.unwrapped.compute_reward()
 
     def train(self, model_path, save_timesteps=50000):
         start_time = time.time()
@@ -262,7 +274,8 @@ class SACAgent():
         alpha_loss_history = deque(maxlen=100)
 
         # Replay buffer
-        buffer = deque(maxlen=self.replay_size)
+        #buffer = deque(maxlen=self.replay_size)
+        local_replay_buffer = [[] for _ in range(n_envs)]
 
         # In training loop, I repeatedly fuse observations since I store the raw observations into the replay buffer
         # Need to research better way
@@ -341,12 +354,16 @@ class SACAgent():
                         "image": final_obs["image"].copy(),
                         "joints": final_obs["joints"].astype(np.float32, copy=True),
                     }
-                buffer.append((obs, actions_np[i], reward[i], next_obs, dones[i], env_episode_ids[i], env_episode_timesteps[i]))
+                step = StepInfo(obs_raw=obs.copy(), action=actions_np[i], reward=reward[i], next_obs_raw=next_obs, done=dones[i])
+                local_replay_buffer[i].append(step)
 
             env_episode_timesteps += 1
 
             for i in range(n_envs):
                 if dones[i]:
+                    self.replay_buffer.add_episode(local_replay_buffer[i])
+                    local_replay_buffer[i] = []
+
                     ret = float(episode_rewards[i])
                     episode_returns.append(ret)
                     episode_count += 1
@@ -388,12 +405,9 @@ class SACAgent():
                         f"{'-'*75}"
                     )
 
-                    env_episode_ids[i] = next_episode_id
-                    next_episode_id += 1
-                    env_episode_timesteps[i] = 0
 
             # Training
-            if len(buffer) > self.learning_steps: # Let buffer fill up before learning
+            if self.replay_buffer.get_total_episodes() > self.learning_steps: # Let buffer fill up before learning
                 batch = random.sample(buffer, k=self.batch_size)
                 obs_raw_, actions_, rewards_, next_obs_raw_, dones_, episode_ids_, episode_timesteps_ = zip(*batch)
 
@@ -441,3 +455,19 @@ class SACAgent():
                 print("max reward achieved")
                 torch.save(self.Actor.state_dict(), f"{model_path}/{global_step}")
                 break
+
+
+class GlobalEpisodicReplayBuffer:
+    def __init__(self, max_episodes):
+        self.buffer = deque(maxlen=max_episodes)
+        self.episode_lengths = deque(maxlen=max_episodes)
+
+    def add_episode(self, episode_steps):
+        """Appends a fully completed episode to the global buffer."""
+        # Append the entire list of steps as a new inner list (Inner 2D/3D)
+        self.buffer.append(episode_steps)
+        # Track the length
+        self.episode_lengths.append(len(episode_steps))
+
+    def get_total_episodes(self):
+        return len(self.buffer)

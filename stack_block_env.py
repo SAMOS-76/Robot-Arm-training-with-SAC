@@ -54,58 +54,42 @@ class S0100Env(MujocoEnv):
         action_scaled = ctrl_min + (action + 1.0) * 0.5 * (ctrl_max - ctrl_min)
         return np.clip(action_scaled, ctrl_min, ctrl_max)
     
-    def get_distance(self):
-        gripper_pos = self.data.site_xpos[self.tip_site_id]
-        red_block_pos = self.data.site_xpos[self.red_block_id]
-        blue_block_pos = self.data.site_xpos[self.blue_block_id]
-        target_bottom_pos = self.data.site_xpos[self.target_bottom_id]
-        target_top_pos = self.data.site_xpos[self.target_top_id]
-
+    def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
+        # Calculate distances based purely on historical buffer data or HER injected goals
         dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
         dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
         dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
         dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
 
-        return {
-            "dist_grab_red": dist_grab_red,
-            "dist_place_red": dist_place_red,
-            "dist_grab_blue": dist_grab_blue,
-            "dist_stack_blue": dist_stack_blue
-        }
-    
-    def compute_reward(self, action):
-        dists = self.get_distance()
         reward = 0.0
         is_success = False
         grab_tolerance = 0.02
+        target_tol = self.target_tolerance 
 
         # The Red Block (Bottom)
-        if dists["dist_place_red"] > self.target_tolerance:
-            # MULTIPLY by 5.0 to make reaching highly incentivized
-            reward -= (5.0 * dists["dist_grab_red"])
-            if dists["dist_grab_red"] < grab_tolerance:
-                reward -= (10.0 * dists["dist_place_red"])
+        if dist_place_red > target_tol:
+            reward -= (5.0 * dist_grab_red)
+            if dist_grab_red < grab_tolerance:
+                reward -= (10.0 * dist_place_red)
                 reward += 1.0 
 
         # The Blue Block (Top) 
         else:
             reward += 5.0 
-            reward -= (5.0 * dists["dist_grab_blue"])
+            reward -= (5.0 * dist_grab_blue)
             
-            if dists["dist_grab_blue"] < grab_tolerance:
-                reward -= (10.0 * dists["dist_stack_blue"])
+            if dist_grab_blue < grab_tolerance:
+                reward -= (10.0 * dist_stack_blue)
                 reward += 1.0 
 
         # Task Completion Evaluation
-        if dists["dist_place_red"] < self.target_tolerance and dists["dist_stack_blue"] < self.target_tolerance:
+        if dist_place_red < target_tol and dist_stack_blue < target_tol:
             reward += 50.0 
             is_success = True
 
-        # MULTIPLY by 0.001 instead of 0.01 (Make the penalty 10x weaker)
         action_penalty = np.sum(np.square(action)) * 0.001
         reward -= action_penalty
 
-        # Keep the / 10.0 scale so the neural networks stay stable!
         return reward / 10.0, is_success
         
     def step(self, action):
@@ -118,7 +102,13 @@ class S0100Env(MujocoEnv):
         self.do_simulation(action_scaled, self.frame_skip)
         observation = self._get_obs()
 
-        reward, is_success = self.compute_reward(action)
+        gripper_pos = self.data.site_xpos[self.tip_site_id]
+        red_block_pos = self.data.site_xpos[self.red_block_id]
+        blue_block_pos = self.data.site_xpos[self.blue_block_id]
+        target_bottom_pos = self.data.site_xpos[self.target_bottom_id]
+        target_top_pos = self.data.site_xpos[self.target_top_id]
+
+        reward, is_success = self.compute_reward(gripper_pos=gripper_pos, red_block_pos=red_block_pos, blue_block_pos=blue_block_pos, target_bottom_pos=target_bottom_pos, target_top_pos=target_top_pos)
 
         if is_success:
             self._success_streak += 1
@@ -192,14 +182,14 @@ class S0100Env(MujocoEnv):
 
         joint_obs = np.concatenate([
             joint_positions,             
-            joint_velocities,             
-            tip_pos,     
-            red_block_pos,        
-            blue_block_pos,                       
+            joint_velocities,                                       
             vec_gripper_to_red,   
             vec_red_to_target,    
             vec_gripper_to_blue,  
             vec_blue_to_target,
+            tip_pos, 
+            red_block_pos,        
+            blue_block_pos, 
             # My goals for HER
             target_bottom_pos,   
             target_top_pos
