@@ -242,14 +242,18 @@ class SACAgent():
             episode_length = self.replay_buffer.episode_lengths[i]
             step = random.randint(0, episode_length-1)
             future_step = random.randint(step+1, episode_length-1)
+
             current_obs = self.replay_buffer[i][step].obs_raw
             current_goal = current_obs["joints"][-6:]
+            current_red_pos = current_obs["joints"][-12:-9]
+            current_blue_pos = current_obs["joints"][-9:-6]
             current_gripper_pos = current_obs["joints"][-15:-12]
+
             future_obs = self.replay_buffer[i][future_step].obs_raw
             future_goal = future_obs["joints"][-12:-6]
             self.replay_buffer[i][step].obs_raw["joints"][-6:] = future_goal
 
-            self.replay_buffer[i][step].reward = self.env.unwrapped.compute_reward()
+            self.replay_buffer[i][step].reward = self.env.unwrapped.compute_reward(current_gripper_pos, current_red_pos, current_blue_pos, future_goal[:3], future_goal[3:])
 
     def train(self, model_path, save_timesteps=50000):
         start_time = time.time()
