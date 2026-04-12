@@ -54,6 +54,20 @@ class S0100Env(MujocoEnv):
         action_scaled = ctrl_min + (action + 1.0) * 0.5 * (ctrl_max - ctrl_min)
         return np.clip(action_scaled, ctrl_min, ctrl_max)
     
+    def get_distance(self):
+        gripper_pos = self.data.site_xpos[self.tip_site_id]
+        red_block_pos = self.data.site_xpos[self.red_block_id]
+        blue_block_pos = self.data.site_xpos[self.blue_block_id]
+        target_bottom_pos = self.data.site_xpos[self.target_bottom_id]
+        target_top_pos = self.data.site_xpos[self.target_top_id]
+
+        return {
+        "dist_grab_red": float(np.linalg.norm(gripper_pos - red_block_pos)),
+        "dist_place_red": float(np.linalg.norm(red_block_pos - target_bottom_pos)),
+        "dist_grab_blue": float(np.linalg.norm(gripper_pos - blue_block_pos)),
+        "dist_stack_blue": float(np.linalg.norm(blue_block_pos - target_top_pos)),
+        }
+    
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
         # Calculate distances based purely on historical buffer data or HER injected goals
         dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
@@ -108,7 +122,7 @@ class S0100Env(MujocoEnv):
         target_bottom_pos = self.data.site_xpos[self.target_bottom_id]
         target_top_pos = self.data.site_xpos[self.target_top_id]
 
-        reward, is_success = self.compute_reward(gripper_pos=gripper_pos, red_block_pos=red_block_pos, blue_block_pos=blue_block_pos, target_bottom_pos=target_bottom_pos, target_top_pos=target_top_pos)
+        reward, is_success = self.compute_reward(gripper_pos=gripper_pos, red_block_pos=red_block_pos, blue_block_pos=blue_block_pos, target_bottom_pos=target_bottom_pos, target_top_pos=target_top_pos, action=action)
 
         if is_success:
             self._success_streak += 1
@@ -123,9 +137,9 @@ class S0100Env(MujocoEnv):
         
         # fix this
         info = {
-            "is_success": is_success,
+            "success": is_success,
             "success_streak": self._success_streak,
-            "distances": self.get_distance() # Handy for logging/debugging
+            "distances": self.get_distance() 
         }
         if self.render_mode == "human":
             self.render()
@@ -149,8 +163,8 @@ class S0100Env(MujocoEnv):
         
         block_noise_range = 0.02
 
-        red_qpos_idx = self.model.jnt_qposadr[self.red_block_id]
-        blue_qpos_idx = self.model.jnt_qposadr[self.blue_block_id]
+        red_qpos_idx = self.model.jnt_qposadr[self.red_joint_id]
+        blue_qpos_idx = self.model.jnt_qposadr[self.blue_joint_id]
 
         qpos[red_qpos_idx : red_qpos_idx + 2] += self.np_random.uniform(low=-block_noise_range, high=block_noise_range, size=2)
         qpos[blue_qpos_idx : blue_qpos_idx + 2] += self.np_random.uniform( low=-block_noise_range, high=block_noise_range, size=2)

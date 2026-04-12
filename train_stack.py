@@ -1,7 +1,7 @@
 import gymnasium as gym
 from stack_block_env import S0100Env
 from stack_block_env import FrameStack
-from SAC_agent import SACAgent
+from SAC_agent_HER import SACAgent
 import os
 import torch
 

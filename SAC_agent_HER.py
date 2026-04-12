@@ -1,4 +1,4 @@
-import random 
+import os 
 import datetime
 import time
 import gymnasium as gym
@@ -233,29 +233,106 @@ class SACAgent():
 
         return actor_loss.item(), alpha_loss.item()
 
+    # def sample(self):
+    #     batch = random.sample(self.replay_buffer, k=self.batch_size)
+
+    #     # Change 80% to HER (seems to be the standard)
+    #     HER_elements = np.random.choice(self.batch_size, size=int(self.batch_size*0.8), replace=False)
+    #     for i in HER_elements:
+    #         episode_length = self.replay_buffer.episode_lengths[i]
+
+    #         step = random.randint(0, episode_length-1)
+    #         future_step = random.randint(step+1, episode_length-1)
+    #         current = self.replay_buffer.buffer[i][step].copy()
+
+    #         current_obs = current.obs_raw
+    #         action = current.buffer[i][step].action
+    #         current_goal = current_obs["joints"][-6:]
+    #         current_red_pos = current_obs["joints"][-12:-9]
+    #         current_blue_pos = current_obs["joints"][-9:-6]
+    #         current_gripper_pos = current_obs["joints"][-15:-12]
+
+    #         future_obs = (self.replay_buffer.buffer[i][future_step].obs_raw).copy()
+    #         future_goal = future_obs["joints"][-12:-6]
+    #         self.replay_buffer.buffer[i][step].obs_raw["joints"][-6:] = future_goal
+
+    #         self.replay_buffer.buffer[i][step].reward = self.env.unwrapped.compute_reward(current_gripper_pos, current_red_pos, current_blue_pos, future_goal[:3], future_goal[3:], action)
+    #         return self.replay_buffer.buffer[i][step]
+        
     def sample(self):
-        batch = random.sample(self.replay_buffer, k=self.batch_size)
+        if self.replay_buffer.get_total_episodes() == 0:
+            print("Replay buffer is empty")
+            return
+        
+        episodes = list(self.replay_buffer.buffer) # To make mutable
+        lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
+        probs = lengths / lengths.sum()
+        episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True, p=probs) # Weighted sampling to prioritise sampling from longer eps
+        HER_masking = np.random.rand(self.batch_size) < 0.8
 
-        # Change 80% to HER (seems to be the standard)
-        HER_elements = np.random.choice(self.batch_size, size=int(self.batch_size*0.8), replace=False)
-        for i in HER_elements:
-            episode_length = self.replay_buffer.episode_lengths[i]
-            step = random.randint(0, episode_length-1)
-            future_step = random.randint(step+1, episode_length-1)
+        obs_batch = []
+        actions_batch = []
+        rewards_batch = []
+        next_obs_batch = []
+        dones_batch = []
 
-            current_obs = self.replay_buffer[i][step].obs_raw
-            current_goal = current_obs["joints"][-6:]
-            current_red_pos = current_obs["joints"][-12:-9]
-            current_blue_pos = current_obs["joints"][-9:-6]
-            current_gripper_pos = current_obs["joints"][-15:-12]
+        for index, episode_id in enumerate(episode_indices):
+            episode = episodes[episode_id]
+            length = len(episode)
+            if HER_masking[index] and length > 1:
+                step = np.random.randint(0, length - 1)  # Error checking to guarantee future step
+            else:
+                step = np.random.randint(0, length)
+            timestep = episode[step]
+            obs = {
+                "image": timestep.obs_raw["image"].copy(),
+                "joints": timestep.obs_raw["joints"].copy(),
+            }
+            next_obs = {
+                "image": timestep.next_obs_raw["image"].copy(),
+                "joints": timestep.next_obs_raw["joints"].copy(),
+            }
+            action = np.asarray(timestep.action, dtype=np.float32).copy()
+            reward = float(timestep.reward)
+            done = float(timestep.done)
 
-            future_obs = self.replay_buffer[i][future_step].obs_raw
-            future_goal = future_obs["joints"][-12:-6]
-            self.replay_buffer[i][step].obs_raw["joints"][-6:] = future_goal
+            if HER_masking[index] and length > 1:
+                future_timestep = np.random.randint(step + 1, length)
+                new_goal = episode[future_timestep].next_obs_raw["joints"][-12:-6].copy()  # [target_bottom, target_top]
 
-            self.replay_buffer[i][step].reward = self.env.unwrapped.compute_reward(current_gripper_pos, current_red_pos, current_blue_pos, future_goal[:3], future_goal[3:])
+                # Chaning old goals with new goals
+                obs["joints"][-6:] = new_goal
+                next_obs["joints"][-6:] = new_goal
+
+                # Cause I've changed the goals I also need to change the distance vectors in the obs
+                obs["joints"][15:18] = new_goal[:3] - obs["joints"][-12:-9]
+                obs["joints"][21:24] = new_goal[3:] - obs["joints"][-9:-6]
+                next_obs["joints"][15:18] = new_goal[:3] - next_obs["joints"][-12:-9]
+                next_obs["joints"][21:24] = new_goal[3:] - next_obs["joints"][-9:-6]
+
+                reward, _ = self.env.unwrapped.compute_reward(
+                    gripper_pos=next_obs["joints"][-15:-12],
+                    red_block_pos=next_obs["joints"][-12:-9],
+                    blue_block_pos=next_obs["joints"][-9:-6],
+                    target_bottom_pos=new_goal[:3],
+                    target_top_pos=new_goal[3:],
+                    action=action,
+                )
+
+            obs_batch.append(obs)
+            actions_batch.append(action)
+            rewards_batch.append(np.float32(reward))
+            next_obs_batch.append(next_obs)
+            dones_batch.append(np.float32(done))
+
+        return (obs_batch, np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), next_obs_batch, np.asarray(dones_batch, dtype=np.float32))
 
     def train(self, model_path, save_timesteps=50000):
+        actor_dir = os.path.join(model_path, "Actor")
+        critic_dir = os.path.join(model_path, "Critic")
+        os.makedirs(actor_dir, exist_ok=True)
+        os.makedirs(critic_dir, exist_ok=True)
+
         start_time = time.time()
         # Kinda need to clean this up...
         n_envs = self.env.num_envs
@@ -411,9 +488,8 @@ class SACAgent():
 
 
             # Training
-            if self.replay_buffer.get_total_episodes() > self.learning_steps: # Let buffer fill up before learning
-                batch = random.sample(buffer, k=self.batch_size)
-                obs_raw_, actions_, rewards_, next_obs_raw_, dones_, episode_ids_, episode_timesteps_ = zip(*batch)
+            if self.replay_buffer.get_total_timesteps() > self.learning_steps: # Let buffer fill up before learning
+                obs_raw_, actions_, rewards_, next_obs_raw_, dones_ = self.sample()
 
                 obs_batch = {
                     "image": np.stack([o["image"] for o in obs_raw_], axis=0),
@@ -450,8 +526,8 @@ class SACAgent():
 
             # Save model after certain amout of timesteps
             if global_step % save_timesteps == 0:
-                torch.save(self.Actor.state_dict(), f"{model_path}/Actor/{global_step}")
-                torch.save(self.Critic.state_dict(), f"{model_path}/Critic/{global_step}")
+                torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}")
+                torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}")
 
 
             # End after last 10 episodes have succeded
@@ -475,3 +551,6 @@ class GlobalEpisodicReplayBuffer:
 
     def get_total_episodes(self):
         return len(self.buffer)
+    
+    def get_total_timesteps(self):
+        return int(sum(self.episode_lengths))
