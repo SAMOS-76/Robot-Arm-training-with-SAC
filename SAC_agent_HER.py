@@ -310,7 +310,9 @@ class SACAgent():
                 next_obs["joints"][15:18] = new_goal[:3] - next_obs["joints"][-12:-9]
                 next_obs["joints"][21:24] = new_goal[3:] - next_obs["joints"][-9:-6]
 
-                reward, _ = self.env.unwrapped.compute_reward(
+                # Cause using vector environments it computes reward for all of them so need to get reward from 1
+                all_results = self.env.call(
+                    "compute_reward",
                     gripper_pos=next_obs["joints"][-15:-12],
                     red_block_pos=next_obs["joints"][-12:-9],
                     blue_block_pos=next_obs["joints"][-9:-6],
@@ -318,6 +320,8 @@ class SACAgent():
                     target_top_pos=new_goal[3:],
                     action=action,
                 )
+
+                reward, _ = all_results[0]
 
             obs_batch.append(obs)
             actions_batch.append(action)
@@ -327,11 +331,40 @@ class SACAgent():
 
         return (obs_batch, np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), next_obs_batch, np.asarray(dones_batch, dtype=np.float32))
 
-    def train(self, model_path, save_timesteps=50000):
+    # Modified existing load checkpoint code
+    def load_checkpoint(self, model_path, timestep, load_critic=True):
+        actor_path = os.path.join(model_path, "Actor", str(timestep))
+        critic_path = os.path.join(model_path, "Critic", str(timestep))
+        encoder_path = os.path.join(model_path, "Encoder", str(timestep))
+
+        if not os.path.isfile(actor_path):
+            raise FileNotFoundError(f"Actor checkpoint not found: {actor_path}")
+
+        actor_state = torch.load(actor_path, map_location=self.device)
+        self.Actor.load_state_dict(actor_state)
+
+        if load_critic:
+            if not os.path.isfile(critic_path):
+                raise FileNotFoundError(f"Critic checkpoint not found: {critic_path}")
+            critic_state = torch.load(critic_path, map_location=self.device)
+            self.Critic.load_state_dict(critic_state)
+            self.TargetCritic.load_state_dict(self.Critic.state_dict())
+
+        if os.path.isfile(encoder_path):
+            encoder_state = torch.load(encoder_path, map_location=self.device)
+            self.encoder.load_state_dict(encoder_state)
+        else:
+            print(f"[WARN] Encoder checkpoint not found: {encoder_path}. Using current encoder weights.")
+
+        print(f"Loaded checkpoint at timestep {timestep}")
+
+    def train(self, model_path, save_timesteps=50000, start_timestep=0):
         actor_dir = os.path.join(model_path, "Actor")
         critic_dir = os.path.join(model_path, "Critic")
+        encoder_dir = os.path.join(model_path, "Encoder")
         os.makedirs(actor_dir, exist_ok=True)
         os.makedirs(critic_dir, exist_ok=True)
+        os.makedirs(encoder_dir, exist_ok=True)
 
         start_time = time.time()
         # Kinda need to clean this up...
@@ -364,7 +397,7 @@ class SACAgent():
         with torch.no_grad():
             fused_obs = self.fuse_observations(raw_obs, detach_encoder=True)
 
-        for global_step in range(self.total_timesteps):
+        for global_step in range(start_timestep, start_timestep + self.total_timesteps):
             # Get next action for current state in the episode
             with torch.no_grad():
                 mean, log_sd = self.Actor(fused_obs)
@@ -528,6 +561,7 @@ class SACAgent():
             if global_step % save_timesteps == 0:
                 torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}")
                 torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}")
+                torch.save(self.encoder.state_dict(), f"{encoder_dir}/{global_step}")
 
 
             # End after last 10 episodes have succeded
