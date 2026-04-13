@@ -33,7 +33,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = SACAgent(env, device=device, timesteps=args.timesteps)
+    model = SACAgent(env, device=device, timesteps=args.timesteps, use_images=False)
 
     start_timestep = 0
     if args.resume_step is not None:

@@ -81,42 +81,64 @@ class S0100Env(MujocoEnv):
         "dist_stack_blue": float(np.linalg.norm(blue_block_pos - target_top_pos)),
         }
     
+    # Stage based reward didn't seem to be working so changing to smooth dynamic rewards instead
+    # def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
+    #     # Calculate distances based purely on historical buffer data or HER injected goals
+    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
+    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
+    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+
+    #     reward = 0.0
+    #     is_success = False
+    #     grab_tolerance = self.grab_tolerance
+    #     stage_tol = self.stage_tolerance
+    #     success_tol = self.success_tolerance
+
+    #     # The Red Block (Bottom)
+    #     if dist_place_red > stage_tol:
+    #         reward -= (5.0 * dist_grab_red)
+    #         if dist_grab_red < grab_tolerance:
+    #             reward -= (10.0 * dist_place_red)
+    #             reward += 1.0 
+
+    #     # The Blue Block (Top) 
+    #     else:
+    #         reward += 5.0 
+    #         reward -= (5.0 * dist_grab_blue)
+            
+    #         if dist_grab_blue < grab_tolerance:
+    #             reward -= (10.0 * dist_stack_blue)
+    #             reward += 1.0 
+
+    #     # Task Completion Evaluation
+    #     if dist_place_red < success_tol and dist_stack_blue < success_tol:
+    #         reward += 50.0 
+    #         is_success = True
+
+    #     action_penalty = np.sum(np.square(action)) * 0.001
+    #     reward -= action_penalty
+
+    #     return reward / 10.0, is_success
+
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-        # Calculate distances based purely on historical buffer data or HER injected goals
         dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
         dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
         dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
         dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
 
-        reward = 0.0
         is_success = False
         grab_tolerance = self.grab_tolerance
         stage_tol = self.stage_tolerance
         success_tol = self.success_tolerance
 
-        # The Red Block (Bottom)
-        if dist_place_red > stage_tol:
-            reward -= (5.0 * dist_grab_red)
-            if dist_grab_red < grab_tolerance:
-                reward -= (10.0 * dist_place_red)
-                reward += 1.0 
+        red_success = dist_place_red < self.success_tolerance
+        blue_success = dist_stack_blue < self.success_tolerance
 
-        # The Blue Block (Top) 
-        else:
-            reward += 5.0 
-            reward -= (5.0 * dist_grab_blue)
-            
-            if dist_grab_blue < grab_tolerance:
-                reward -= (10.0 * dist_stack_blue)
-                reward += 1.0 
+        is_success = np.logical_and(red_success, blue_success)
 
-        # Task Completion Evaluation
-        if dist_place_red < success_tol and dist_stack_blue < success_tol:
-            reward += 50.0 
-            is_success = True
-
-        action_penalty = np.sum(np.square(action)) * 0.001
-        reward -= action_penalty
+        # Sparse reward: 0.0 for success, -1.0 for failure
+        reward = np.where(is_success, 0.0, -1.0)
 
         return reward / 10.0, is_success
         

@@ -103,10 +103,11 @@ class CNNEncoder(nn.Module):
     
 # SAC class
 class SACAgent():
-    def __init__(self, env, device, timesteps = 1000000):
+    def __init__(self, env, device, timesteps=1000000, use_images=False):
         self.env = env
         self.device = device
         self.total_timesteps = timesteps
+        self.use_images = bool(use_images)
         self.replay_buffer = GlobalEpisodicReplayBuffer(max_episodes=1000)
 
         # Hyperparameters
@@ -119,32 +120,38 @@ class SACAgent():
         self.latent_dim = 50
 
         joint_dim = env.single_observation_space["joints"].shape[0]
-        image_shape = env.single_observation_space["image"].shape
-        # Get fused size of env observations by adding joint dims to latent dimension
         act_dim = env.single_action_space.shape[0]
-        self.fused_obs_dim = self.latent_dim + joint_dim
+
+        if self.use_images:
+            image_shape = env.single_observation_space["image"].shape
+            self.encoder = CNNEncoder(image_shape, latent_dim=self.latent_dim).to(self.device)
+            self.fused_obs_dim = self.latent_dim + joint_dim
+        else:
+            self.encoder = None
+            self.fused_obs_dim = joint_dim
 
         # Network Initialisation
-        self.encoder = CNNEncoder(image_shape, latent_dim=self.latent_dim).to(self.device)
         self.Critic = CriticNetworks(self.fused_obs_dim, act_dim).to(self.device)
         self.Actor = ActorNetwork(self.fused_obs_dim, act_dim).to(self.device)
         self.TargetCritic = CriticNetworks(self.fused_obs_dim, act_dim).to(self.device)
-        # Make TargetCritic weights the same as Critic 
+
         self.TargetCritic.load_state_dict(self.Critic.state_dict())
         for parameter in self.TargetCritic.parameters():
             parameter.requires_grad = False
 
         self.actor_optim = torch.optim.Adam(self.Actor.parameters(), lr=self.actor_learning_rate)
-        self.critic_optim = torch.optim.Adam(list(self.Critic.parameters()) + list(self.encoder.parameters()), lr=self.critic_learning_rate)
 
-        # We optimize the log of alpha to ensure alpha always remains positive
+        critic_params = list(self.Critic.parameters())
+        if self.encoder is not None:
+            critic_params.extend(list(self.encoder.parameters()))
+        self.critic_optim = torch.optim.Adam(critic_params, lr=self.critic_learning_rate)
+
         self.log_alpha = torch.tensor(np.log(0.1), requires_grad=True, device=self.device)
         self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=0.0003)
         self.target_entropy = -act_dim
 
-        self.log_every_episodes = 10 
+        self.log_every_episodes = 10
 
-        # Keep HER reward relabeling numerically consistent with the environment.
         self.grab_tolerance = 0.025
         self.stage_tolerance = 0.03
         self.success_tolerance = 0.02
@@ -179,17 +186,18 @@ class SACAgent():
         if env_success_tol is not None:
             self.success_tolerance = env_success_tol
 
-    def fuse_observations(self, obs, detach_encoder=False): # detach encoder for actor
-        # We don't want the CNN optimisation to be affected by the actor so we detech it when fusing obs for the Actor network
-        images = torch.as_tensor(obs["image"], device=self.device)
+    def fuse_observations(self, obs, detach_encoder=False):
         joints = torch.as_tensor(obs["joints"], dtype=torch.float32, device=self.device)
-
-        if images.ndim == 3:
-            images = images.unsqueeze(0)
         if joints.ndim == 1:
             joints = joints.unsqueeze(0)
 
-        # Reformat image 1) to be 0 to 1 (better training) 2) Correct dimension order to be processed by pytorch 
+        if not self.use_images:
+            return joints
+
+        images = torch.as_tensor(obs["image"], device=self.device)
+        if images.ndim == 3:
+            images = images.unsqueeze(0)
+
         images = images.float() / 255.0
         images = images.permute(0, 3, 1, 2).contiguous()
 
@@ -197,7 +205,6 @@ class SACAgent():
         if detach_encoder:
             latent_image = latent_image.detach()
 
-        # Concatenate observations
         fused_obs = torch.cat([latent_image, joints], dim=1)
         return fused_obs
 
@@ -353,31 +360,24 @@ class SACAgent():
             else:
                 step = np.random.randint(0, length)
             timestep = episode[step]
-            obs = {
-                "image": timestep.obs_raw["image"].copy(),
-                "joints": timestep.obs_raw["joints"].copy(),
-            }
-            next_obs = {
-                "image": timestep.next_obs_raw["image"].copy(),
-                "joints": timestep.next_obs_raw["joints"].copy(),
-            }
+            obs_joints = timestep.obs_raw.copy()
+            next_obs_joints = timestep.next_obs_raw.copy()
             action = np.asarray(timestep.action, dtype=np.float32).copy()
             reward = float(timestep.reward)
             done = float(timestep.done)
 
             if HER_masking[index] and length > 1:
                 future_timestep = np.random.randint(step + 1, length)
-                new_goal = episode[future_timestep].next_obs_raw["joints"][-12:-6].copy()  # [target_bottom, target_top]
+                new_goal = episode[future_timestep].next_obs_raw[-12:-6].copy()  # [target_bottom, target_top]
 
                 # Chaning old goals with new goals
-                obs["joints"][-6:] = new_goal
-                next_obs["joints"][-6:] = new_goal
-
+                obs_joints[-6:] = new_goal
+                next_obs_joints[-6:] = new_goal
                 # Cause I've changed the goals I also need to change the distance vectors in the obs
-                obs["joints"][15:18] = new_goal[:3] - obs["joints"][-12:-9]
-                obs["joints"][21:24] = new_goal[3:] - obs["joints"][-9:-6]
-                next_obs["joints"][15:18] = new_goal[:3] - next_obs["joints"][-12:-9]
-                next_obs["joints"][21:24] = new_goal[3:] - next_obs["joints"][-9:-6]
+                obs_joints[15:18] = new_goal[:3] - obs_joints[-12:-9]
+                obs_joints[21:24] = new_goal[3:] - obs_joints[-9:-6]
+                next_obs_joints[15:18] = new_goal[:3] - next_obs_joints[-12:-9]
+                next_obs_joints[21:24] = new_goal[3:] - next_obs_joints[-9:-6]
 
                 # Cause using vector environments it computes reward for all of them so need to get reward from 1 
                 # This made trainig so slow....
@@ -392,18 +392,18 @@ class SACAgent():
                 # )
 
                 reward = self._compute_reward_numpy(
-                    gripper_pos=next_obs["joints"][-15:-12],
-                    red_block_pos=next_obs["joints"][-12:-9],
-                    blue_block_pos=next_obs["joints"][-9:-6],
+                    gripper_pos=next_obs_joints[-15:-12],
+                    red_block_pos=next_obs_joints[-12:-9],
+                    blue_block_pos=next_obs_joints[-9:-6],
                     target_bottom_pos=new_goal[:3],
                     target_top_pos=new_goal[3:],
                     action=action,
-                    )
+                )
 
-            obs_batch.append(obs)
+            obs_batch.append(obs_joints.astype(np.float32, copy=False))
             actions_batch.append(action)
             rewards_batch.append(np.float32(reward))
-            next_obs_batch.append(next_obs)
+            next_obs_batch.append(next_obs_joints.astype(np.float32, copy=False))
             dones_batch.append(np.float32(done))
 
         return (obs_batch, np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), next_obs_batch, np.asarray(dones_batch, dtype=np.float32))
@@ -428,11 +428,12 @@ class SACAgent():
             self.Critic.load_state_dict(critic_state)
             self.TargetCritic.load_state_dict(self.Critic.state_dict())
 
-        if os.path.isfile(encoder_path):
-            encoder_state = torch.load(encoder_path, map_location=self.device)
-            self.encoder.load_state_dict(encoder_state)
-        else:
-            print(f"[WARN] Encoder checkpoint not found: {encoder_path}. Using current encoder weights.")
+        if self.encoder is not None:
+            if os.path.isfile(encoder_path):
+                encoder_state = torch.load(encoder_path, map_location=self.device)
+                self.encoder.load_state_dict(encoder_state)
+            else:
+                print(f"[WARN] Encoder checkpoint not found: {encoder_path}. Using current encoder weights.")
 
         if os.path.isfile(alpha_path):
             alpha_state = torch.load(alpha_path, map_location=self.device)
@@ -451,7 +452,8 @@ class SACAgent():
         os.makedirs(alpha_dir, exist_ok=True)
         os.makedirs(actor_dir, exist_ok=True)
         os.makedirs(critic_dir, exist_ok=True)
-        os.makedirs(encoder_dir, exist_ok=True)
+        if self.encoder is not None:
+            os.makedirs(encoder_dir, exist_ok=True)
 
         start_time = time.time()
         # Kinda need to clean this up...
@@ -542,21 +544,13 @@ class SACAgent():
 
                 # Get states from all vectorised environments and append to replay buffer
                 for i in range(n_envs):
-                    obs = {
-                        "image": raw_obs["image"][i].copy(),
-                        "joints": raw_obs["joints"][i].astype(np.float32, copy=True),
-                    }
-                    next_obs = {
-                        "image": raw_next_obs["image"][i].copy(),
-                        "joints": raw_next_obs["joints"][i].astype(np.float32, copy=True),
-                    }
+                    obs_joints = raw_obs["joints"][i].astype(np.float32, copy=True)
+                    next_obs_joints = raw_next_obs["joints"][i].astype(np.float32, copy=True)
+
                     if "final_observation" in infos and infos.get("_final_observation", [False] * n_envs)[i]:
                         final_obs = infos["final_observation"][i]
-                        next_obs = {
-                            "image": final_obs["image"].copy(),
-                            "joints": final_obs["joints"].astype(np.float32, copy=True),
-                        }
-                    step = StepInfo(obs_raw=obs.copy(), action=actions_np[i], reward=reward[i], next_obs_raw=next_obs, done=dones[i])
+                        next_obs_joints = final_obs["joints"].astype(np.float32, copy=True)
+                    step = StepInfo(obs_raw=obs_joints.copy(), action=actions_np[i], reward=reward[i], next_obs_raw=next_obs_joints, done=dones[i])
                     local_replay_buffer[i].append(step)
 
                 env_episode_timesteps += 1
@@ -612,16 +606,10 @@ class SACAgent():
 
                 # Training
                 if self.replay_buffer.get_total_timesteps() > self.learning_steps: # Let buffer fill up before learning
-                    obs_raw_, actions_, rewards_, next_obs_raw_, dones_ = self.sample()
+                    obs_joints_, actions_, rewards_, next_obs_joints_, dones_ = self.sample()
 
-                    obs_batch = {
-                        "image": np.stack([o["image"] for o in obs_raw_], axis=0),
-                        "joints": np.stack([o["joints"] for o in obs_raw_], axis=0),
-                    }
-                    next_obs_batch = {
-                        "image": np.stack([o["image"] for o in next_obs_raw_], axis=0),
-                        "joints": np.stack([o["joints"] for o in next_obs_raw_], axis=0),
-                    }
+                    obs_batch = {"joints": obs_joints_}
+                    next_obs_batch = {"joints": next_obs_joints_}
 
                     # Convert numpy values to tensors
                     tensor_obs = self.fuse_observations(obs_batch, detach_encoder=False)
@@ -652,7 +640,8 @@ class SACAgent():
                 if global_step % save_timesteps == 0 or (len(episode_returns) > 10 and np.mean(episode_returns[-10:]) >= 0):
                     torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}")
                     torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}")
-                    torch.save(self.encoder.state_dict(), f"{encoder_dir}/{global_step}")
+                    if self.encoder is not None:
+                        torch.save(self.encoder.state_dict(), f"{encoder_dir}/{global_step}")
                     torch.save(
                         {
                             "log_alpha": self.log_alpha.detach().cpu(),
@@ -668,7 +657,9 @@ class SACAgent():
             # Save with the current global_step or a specific "interrupted" suffix
             torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}_interrupted")
             torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}_interrupted")
-            torch.save(self.encoder.state_dict(), f"{encoder_dir}/{global_step}_interrupted")
+
+            if self.encoder is not None:
+                torch.save(self.encoder.state_dict(), f"{encoder_dir}/{global_step}_interrupted")
             torch.save(
                 {
                     "log_alpha": self.log_alpha.detach().cpu(),
