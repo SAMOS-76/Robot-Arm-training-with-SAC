@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume-step", type=int, default=None, help="Load actor/critic checkpoint from this timestep")
     parser.add_argument("--timesteps", type=int, default=1_000_000, help="Number of additional training steps to run")
-    parser.add_argument("--save-timesteps", type=int, default=50_000, help="Checkpoint save interval")
+    parser.add_argument("--save-timesteps", type=int, default=12_500, help="Checkpoint save interval")
     args = parser.parse_args()
 
     models_dir = "models/SAC_stacking"

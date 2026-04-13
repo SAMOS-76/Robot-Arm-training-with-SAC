@@ -9,7 +9,16 @@ import collections
 class S0100Env(MujocoEnv):
     metadata = {"render_modes": ["human", "rgb_array", "depth_array"]}
     
-    def __init__(self, render_mode=None, max_episode_steps=200, success_distance=0.03, success_hold_steps=3, obs_type="blind"):
+    def __init__(
+        self,
+        render_mode=None,
+        max_episode_steps=200,
+        success_distance=0.02,
+        stage_distance=0.03,
+        grab_distance=0.025,
+        success_hold_steps=3,
+        obs_type="blind",
+    ):
         xml_file = os.path.join(os.path.dirname(__file__), "SO101/block_stack.xml")
         frame_skip = 20
         
@@ -30,7 +39,11 @@ class S0100Env(MujocoEnv):
 
         self.max_episode_steps = int(max_episode_steps)
         self.success_hold_steps = int(success_hold_steps) 
-        self.target_tolerance = success_distance          
+        self.success_tolerance = float(success_distance)
+        self.stage_tolerance = float(max(stage_distance, self.success_tolerance))
+        self.grab_tolerance = float(grab_distance)
+        # Backward-compat alias used by older scripts.
+        self.target_tolerance = self.success_tolerance
         self._episode_step = 0
         self._success_streak = 0
         self._prev_action = np.zeros(self.n_actuators, dtype=np.float32)
@@ -77,11 +90,12 @@ class S0100Env(MujocoEnv):
 
         reward = 0.0
         is_success = False
-        grab_tolerance = 0.02
-        target_tol = self.target_tolerance 
+        grab_tolerance = self.grab_tolerance
+        stage_tol = self.stage_tolerance
+        success_tol = self.success_tolerance
 
         # The Red Block (Bottom)
-        if dist_place_red > target_tol:
+        if dist_place_red > stage_tol:
             reward -= (5.0 * dist_grab_red)
             if dist_grab_red < grab_tolerance:
                 reward -= (10.0 * dist_place_red)
@@ -97,7 +111,7 @@ class S0100Env(MujocoEnv):
                 reward += 1.0 
 
         # Task Completion Evaluation
-        if dist_place_red < target_tol and dist_stack_blue < target_tol:
+        if dist_place_red < success_tol and dist_stack_blue < success_tol:
             reward += 50.0 
             is_success = True
 
@@ -212,9 +226,6 @@ class S0100Env(MujocoEnv):
         if self.obs_type == "state":
             return joint_obs
 
-
-        self.mujoco_renderer.update_scene(self.data, camera="gripper_camera")
-        rgb_image = self.mujoco_renderer.render()
 
         if self.obs_type == "blind":
             rgb_image = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
