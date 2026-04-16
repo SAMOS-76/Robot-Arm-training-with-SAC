@@ -9,8 +9,8 @@ import numpy as np
 import torch
 from torch.distributions import Normal
 
-from SAC_agent_HER import ActorNetwork
-from stack_block_env import S0100Env
+from Agents.SAC_curriculum import ActorNetwork
+from environments.stack_block_env import S0100Env
 
 
 def _extract_step(checkpoint_name: str):

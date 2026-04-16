@@ -1,5 +1,5 @@
 import gymnasium as gym
-from s0_100_env import S0100Env
+from environments.s0_100_env import S0100Env
 from SAC_agent import SACAgent
 import os
 import torch

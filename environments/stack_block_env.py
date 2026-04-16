@@ -9,16 +9,7 @@ import collections
 class S0100Env(MujocoEnv):
     metadata = {"render_modes": ["human", "rgb_array", "depth_array"]}
     
-    def __init__(
-        self,
-        render_mode=None,
-        max_episode_steps=200,
-        success_distance=0.02,
-        stage_distance=0.03,
-        grab_distance=0.025,
-        success_hold_steps=3,
-        obs_type="blind",
-    ):
+    def __init__(self, render_mode=None, max_episode_steps=200, success_distance=0.02, stage_distance=0.03, grab_distance=0.025, success_hold_steps=3, obs_type="blind"):
         xml_file = os.path.join(os.path.dirname(__file__), "SO101/block_stack.xml")
         frame_skip = 20
         
@@ -81,92 +72,6 @@ class S0100Env(MujocoEnv):
         "dist_grab_blue": float(np.linalg.norm(gripper_pos - blue_block_pos)),
         "dist_stack_blue": float(np.linalg.norm(blue_block_pos - target_top_pos)),
         }
-    
-    # Stage based reward didn't seem to be working so changing to smooth dynamic rewards instead
-    # def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-    #     # Calculate distances based purely on historical buffer data or HER injected goals
-    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
-    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
-    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-
-    #     reward = 0.0
-    #     is_success = False
-    #     grab_tolerance = self.grab_tolerance
-    #     stage_tol = self.stage_tolerance
-    #     success_tol = self.success_tolerance
-
-    #     # The Red Block (Bottom)
-    #     if dist_place_red > stage_tol:
-    #         reward -= (5.0 * dist_grab_red)
-    #         if dist_grab_red < grab_tolerance:
-    #             reward -= (10.0 * dist_place_red)
-    #             reward += 1.0 
-
-    #     # The Blue Block (Top) 
-    #     else:
-    #         reward += 5.0 
-    #         reward -= (5.0 * dist_grab_blue)
-            
-    #         if dist_grab_blue < grab_tolerance:
-    #             reward -= (10.0 * dist_stack_blue)
-    #             reward += 1.0 
-
-    #     # Task Completion Evaluation
-    #     if dist_place_red < success_tol and dist_stack_blue < success_tol:
-    #         reward += 50.0 
-    #         is_success = True
-
-    #     action_penalty = np.sum(np.square(action)) * 0.001
-    #     reward -= action_penalty
-
-    #     return reward / 10.0, is_success
-
-    # Stage based sparse reward function
-    # def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
-    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
-    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-
-    #     red_stage_done = dist_place_red < self.stage_tolerance
-    #     red_success = dist_place_red < self.success_tolerance
-    #     blue_success = dist_stack_blue < self.success_tolerance
-    #     is_success = bool(red_success and blue_success)
-
-    #     reward = 0.0
-
-    #     # Always keep approach pressure on both blocks
-    #     reward -= 2.0 * dist_grab_red
-    #     reward -= 1.0 * dist_grab_blue
-
-    #     # Stage 1: place red block onto bottom target
-    #     if not red_stage_done:
-    #         reward -= 8.0 * dist_place_red
-    #         if dist_grab_red < self.grab_tolerance:
-    #             reward += 1.0
-    #     # Stage 2: stack blue block onto top target once red is placed
-    #     else:
-    #         reward += 3.0
-    #         reward -= 8.0 * dist_stack_blue
-    #         if dist_grab_blue < self.grab_tolerance:
-    #             reward += 1.0
-
-    #     # Milestone bonuses
-    #     if red_success:
-    #         reward += 2.0
-    #     if blue_success:
-    #         reward += 2.0
-
-    #     # Terminal task completion bonus
-    #     if is_success:
-    #         reward += 30.0
-
-    #     # Small regularization on control effort
-    #     action_penalty = 0.001 * np.sum(np.square(action))
-    #     reward -= action_penalty
-
-    #     return float(reward), is_success
 
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
         dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
@@ -208,7 +113,6 @@ class S0100Env(MujocoEnv):
         # Terminated: For if the robot carried out outcome or note
         # Trunated: If the robot action neither succeeded or failed (usually a time limit)
         
-        # fix this
         info = {
             "success": is_success,
             "success_streak": self._success_streak,

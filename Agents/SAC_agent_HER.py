@@ -71,6 +71,7 @@ class CriticNetworks(nn.Module):
     
 # Image encoder for specific robot implementation with camera
 # Need to compress image into latent space embedding to be concatenated with robot observations
+# NOTE: removed encoder to speed up training
 class CNNEncoder(nn.Module):
     def __init__(self, image_shape, hidden=10, latent_dim=50):
         super().__init__()
@@ -126,12 +127,13 @@ class SACAgent():
         self.random_explore_steps = 50_000
         self.latent_dim = 50
 
-        # Transition-capped episodic replay (HER-compatible)
+        # Transition-capped episodic replay 
         self.replay_buffer = GlobalEpisodicReplayBuffer(max_transitions=self.replay_size)
 
         joint_dim = env.single_observation_space["joints"].shape[0]
         act_dim = env.single_action_space.shape[0]
 
+        # To switch between learning from video or not
         if self.use_images:
             image_shape = env.single_observation_space["image"].shape
             self.encoder = CNNEncoder(image_shape, latent_dim=self.latent_dim).to(self.device)
@@ -196,6 +198,7 @@ class SACAgent():
         if env_success_tol is not None:
             self.success_tolerance = env_success_tol
 
+    # Fuse joint and image observations if using image input
     def fuse_observations(self, obs, detach_encoder=False):
         joints = torch.as_tensor(obs["joints"], dtype=torch.float32, device=self.device)
         if joints.ndim == 1:
@@ -289,83 +292,6 @@ class SACAgent():
 
         return actor_loss.item(), alpha_loss.item()
 
-    # def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-    #     # Calculate distances based purely on historical buffer data or HER injected goals.
-    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
-    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
-    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-
-    #     reward = 0.0
-
-    #     # Stage 1: place red close enough before emphasizing blue stacking.
-    #     if dist_place_red > self.stage_tolerance:
-    #         reward -= (5.0 * dist_grab_red)
-    #         if dist_grab_red < self.grab_tolerance:
-    #             reward -= (10.0 * dist_place_red)
-    #             reward += 1.0
-
-    #     # Stage 2: reward blue block pickup and stack onto red target.
-    #     else:
-    #         reward += 5.0
-    #         reward -= (5.0 * dist_grab_blue)
-
-    #         if dist_grab_blue < self.grab_tolerance:
-    #             reward -= (10.0 * dist_stack_blue)
-    #             reward += 1.0
-
-    #     is_success = bool(
-    #         dist_place_red < self.success_tolerance
-    #         and dist_stack_blue < self.success_tolerance
-    #     )
-    #     if is_success:
-    #         reward += 50.0
-
-    #     action_penalty = np.sum(np.square(action)) * 0.001
-    #     reward -= action_penalty
-
-    #     return reward / 10.0, is_success
-
-    # Stage based sparse reward function
-    # def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
-    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
-    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-
-    #     red_stage_done = dist_place_red < self.stage_tolerance
-    #     red_success = dist_place_red < self.success_tolerance
-    #     blue_success = dist_stack_blue < self.success_tolerance
-    #     is_success = bool(red_success and blue_success)
-
-    #     reward = 0.0
-
-    #     reward -= 2.0 * dist_grab_red
-    #     reward -= 1.0 * dist_grab_blue
-
-    #     if not red_stage_done:
-    #         reward -= 8.0 * dist_place_red
-    #         if dist_grab_red < self.grab_tolerance:
-    #             reward += 1.0
-    #     else:
-    #         reward += 3.0
-    #         reward -= 8.0 * dist_stack_blue
-    #         if dist_grab_blue < self.grab_tolerance:
-    #             reward += 1.0
-
-    #     if red_success:
-    #         reward += 2.0
-    #     if blue_success:
-    #         reward += 2.0
-
-    #     if is_success:
-    #         reward += 30.0
-
-    #     action_penalty = 0.001 * np.sum(np.square(action))
-    #     reward -= action_penalty
-
-    #     return float(reward), is_success
-
     def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
         dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
         dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
@@ -377,26 +303,6 @@ class SACAgent():
         reward = 0.0 if is_success else -1.0
         return float(reward), is_success
 
-    def _compute_reward_numpy(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-        reward, success = self._compute_reward_and_success(
-            gripper_pos=gripper_pos,
-            red_block_pos=red_block_pos,
-            blue_block_pos=blue_block_pos,
-            target_bottom_pos=target_bottom_pos,
-            target_top_pos=target_top_pos,
-            action=action,
-        )
-        return float(reward), success
-
-    def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-        return self._compute_reward_and_success(
-            gripper_pos=gripper_pos,
-            red_block_pos=red_block_pos,
-            blue_block_pos=blue_block_pos,
-            target_bottom_pos=target_bottom_pos,
-            target_top_pos=target_top_pos,
-            action=action,
-        )
         
     def sample(self):
         if self.replay_buffer.get_total_episodes() == 0:
@@ -443,19 +349,7 @@ class SACAgent():
                 next_obs_joints[15:18] = new_goal[:3] - next_obs_joints[-12:-9]
                 next_obs_joints[21:24] = new_goal[3:] - next_obs_joints[-9:-6]
 
-                # Cause using vector environments it computes reward for all of them so need to get reward from 1 
-                # This made trainig so slow....
-                # all_results = self.env.call(
-                #     "compute_reward",
-                #     gripper_pos=next_obs["joints"][-15:-12],
-                #     red_block_pos=next_obs["joints"][-12:-9],
-                #     blue_block_pos=next_obs["joints"][-9:-6],
-                #     target_bottom_pos=new_goal[:3],
-                #     target_top_pos=new_goal[3:],
-                #     action=action,
-                # )
-
-                reward, success = self._compute_reward_numpy(
+                reward, success = self._compute_reward_and_success(
                     gripper_pos=next_obs_joints[-15:-12],
                     red_block_pos=next_obs_joints[-12:-9],
                     blue_block_pos=next_obs_joints[-9:-6],
@@ -475,6 +369,7 @@ class SACAgent():
             dones_batch.append(np.float32(done))
 
         return (np.stack(obs_batch, axis=0), np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), np.stack(next_obs_batch, axis=0), np.asarray(dones_batch, dtype=np.float32))
+
     # Modified existing load checkpoint code
     def load_checkpoint(self, model_path, timestep, load_critic=True):
         actor_path = os.path.join(model_path, "Actor", str(timestep))
@@ -543,8 +438,7 @@ class SACAgent():
         actor_loss_history = deque(maxlen=100)
         alpha_loss_history = deque(maxlen=100)
 
-        # Replay buffer
-        #buffer = deque(maxlen=self.replay_size)
+        # Local Replay buffer
         local_replay_buffer = [[] for _ in range(n_envs)]
 
         # In training loop, I repeatedly fuse observations since I store the raw observations into the replay buffer
@@ -583,7 +477,6 @@ class SACAgent():
 
                 # Info for each timestep
                 step_success = np.full(n_envs, np.nan, dtype=np.float32)
-                
                 step_grab_red = np.full(n_envs, np.nan, dtype=np.float32)
                 step_place_red = np.full(n_envs, np.nan, dtype=np.float32)
                 step_grab_blue = np.full(n_envs, np.nan, dtype=np.float32)
@@ -610,7 +503,6 @@ class SACAgent():
                             if "success" in final_info:
                                 step_success[i] = 1.0 if bool(final_info["success"]) else 0.0
                                 
-                            # MODIFIED: Extract final info distances safely
                             if "distances" in final_info:
                                 f_dists = final_info["distances"]
                                 step_grab_red[i] = float(f_dists.get("dist_grab_red", np.nan))
@@ -678,7 +570,6 @@ class SACAgent():
                                 f"    └─ Device: {self.device}\n"
                                 f"{'-'*75}"
                             )
-
 
                 # Training
                 if (self.replay_buffer.get_total_timesteps() > self.learning_steps and (global_step * n_envs) >= self.random_explore_steps):
@@ -762,25 +653,6 @@ class SACAgent():
                 f"{alpha_dir}/{global_step}_interrupted",
             )
             print(f"Models saved at step {global_step}. Exiting.")
-
-
-# class GlobalEpisodicReplayBuffer:
-#     def __init__(self, max_episodes):
-#         self.buffer = deque(maxlen=max_episodes)
-#         self.episode_lengths = deque(maxlen=max_episodes)
-
-#     def add_episode(self, episode_steps):
-#         """Appends a fully completed episode to the global buffer."""
-#         # Append the entire list of steps as a new inner list (Inner 2D/3D)
-#         self.buffer.append(episode_steps)
-#         # Track the length
-#         self.episode_lengths.append(len(episode_steps))
-
-#     def get_total_episodes(self):
-#         return len(self.buffer)
-    
-#     def get_total_timesteps(self):
-#         return int(sum(self.episode_lengths))
 
 class GlobalEpisodicReplayBuffer:
     def __init__(self, max_transitions):

@@ -1,17 +1,18 @@
 import gymnasium as gym
-from stack_block_env import S0100Env
-from stack_block_env import FrameStack
-from SAC_agent_HER import SACAgent
+from environments.curriculum_env import S0100Env
+from environments.curriculum_env import FrameStack
+from Agents.SAC_curriculum import SACAgent
 import os
 import argparse
 import torch
 
-def make_env(max_episode_steps=400, success_hold_steps=3):
+def make_env(max_episode_steps=400, success_hold_steps=3, task_stage=1):
     def _init():
         env = S0100Env(
             render_mode=None,
             max_episode_steps=max_episode_steps,
             success_hold_steps=success_hold_steps,
+            task_stage=task_stage,
         )
         # env = FrameStack(env, num_stack=3)
         return env
@@ -24,6 +25,7 @@ def main():
     parser.add_argument("--save-timesteps", type=int, default=12_500, help="Checkpoint save interval")
     parser.add_argument("--episode-steps", type=int, default=400, help="Episode horizon handled by S0100Env")
     parser.add_argument("--success-hold-steps", type=int, default=1, help="Consecutive success steps before terminate")
+    parser.add_argument("--task-stage", type=int, choices=[1, 2, 3, 4], default=1, help="Curriculum stage: 1=reach, 2=slide, 3=pick-place, 4=stack")
     parser.add_argument("--num-envs", type=int, default=12, help="Number of parallel environments")
     parser.add_argument("--replay-size", type=int, default=1_000_000, help="Replay capacity in transitions")
     parser.add_argument("--batch-size", type=int, default=512, help="Mini-batch size")
@@ -39,7 +41,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     num_envs = args.num_envs
-    env = gym.vector.AsyncVectorEnv([make_env(args.episode_steps, args.success_hold_steps) for _ in range(num_envs)])
+    env = gym.vector.AsyncVectorEnv([make_env(args.episode_steps, args.success_hold_steps, args.task_stage)for _ in range(num_envs)])
+
     model = SACAgent(
         env,
         device=device,
