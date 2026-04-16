@@ -49,7 +49,8 @@ class S0100Env(MujocoEnv):
         self._prev_action = np.zeros(self.n_actuators, dtype=np.float32)
         
         super().__init__(model_path=xml_file, frame_skip=frame_skip, observation_space=self.observation_space, render_mode=render_mode)
-        self.mujoco_renderer = mujoco.Renderer(self.model, height=self.img_height, width=self.img_width)
+        #self.mujoco_renderer = mujoco.Renderer(self.model, height=self.img_height, width=self.img_width)
+        self.mujoco_renderer = None
         self.tip_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
         self.red_block_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "block_red_site")
         self.blue_block_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "block_blue_site")
@@ -121,26 +122,62 @@ class S0100Env(MujocoEnv):
 
     #     return reward / 10.0, is_success
 
+    # Stage based sparse reward function
+    # def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
+    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
+    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
+    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+
+    #     red_stage_done = dist_place_red < self.stage_tolerance
+    #     red_success = dist_place_red < self.success_tolerance
+    #     blue_success = dist_stack_blue < self.success_tolerance
+    #     is_success = bool(red_success and blue_success)
+
+    #     reward = 0.0
+
+    #     # Always keep approach pressure on both blocks
+    #     reward -= 2.0 * dist_grab_red
+    #     reward -= 1.0 * dist_grab_blue
+
+    #     # Stage 1: place red block onto bottom target
+    #     if not red_stage_done:
+    #         reward -= 8.0 * dist_place_red
+    #         if dist_grab_red < self.grab_tolerance:
+    #             reward += 1.0
+    #     # Stage 2: stack blue block onto top target once red is placed
+    #     else:
+    #         reward += 3.0
+    #         reward -= 8.0 * dist_stack_blue
+    #         if dist_grab_blue < self.grab_tolerance:
+    #             reward += 1.0
+
+    #     # Milestone bonuses
+    #     if red_success:
+    #         reward += 2.0
+    #     if blue_success:
+    #         reward += 2.0
+
+    #     # Terminal task completion bonus
+    #     if is_success:
+    #         reward += 30.0
+
+    #     # Small regularization on control effort
+    #     action_penalty = 0.001 * np.sum(np.square(action))
+    #     reward -= action_penalty
+
+    #     return float(reward), is_success
+
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-        dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
-        dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-        dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
-        dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+        dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+        dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
 
-        is_success = False
-        grab_tolerance = self.grab_tolerance
-        stage_tol = self.stage_tolerance
-        success_tol = self.success_tolerance
+        red_success = dist_red < self.success_tolerance
+        blue_success = dist_blue < self.success_tolerance
+        is_success = bool(red_success and blue_success)
 
-        red_success = dist_place_red < self.success_tolerance
-        blue_success = dist_stack_blue < self.success_tolerance
-
-        is_success = np.logical_and(red_success, blue_success)
-
-        # Sparse reward: 0.0 for success, -1.0 for failure
-        reward = np.where(is_success, 0.0, -1.0)
-
-        return reward / 10.0, is_success
+        reward = 0.0 if is_success else -1.0
+        return float(reward), is_success
         
     def step(self, action):
         # What happens during one time step

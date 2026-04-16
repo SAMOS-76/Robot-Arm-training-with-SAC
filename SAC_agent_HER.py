@@ -22,6 +22,8 @@ class ActorNetwork(nn.Module):
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU()
         )
 
@@ -48,11 +50,15 @@ class CriticNetworks(nn.Module):
         self.network1 = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1)
         )
 
         self.network2 = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1)
         )
@@ -103,21 +109,25 @@ class CNNEncoder(nn.Module):
     
 # SAC class
 class SACAgent():
-    def __init__(self, env, device, timesteps=1000000, use_images=False):
+    def __init__(self, env, device, timesteps=1000000, use_images=False, replay_size=1_000_000, batch_size=512, updates_per_step=2):
         self.env = env
         self.device = device
         self.total_timesteps = timesteps
         self.use_images = bool(use_images)
-        self.replay_buffer = GlobalEpisodicReplayBuffer(max_episodes=1000)
 
         # Hyperparameters
-        self.critic_learning_rate = 0.0003
-        self.actor_learning_rate = 0.0003
+        self.critic_learning_rate = 0.0001
+        self.actor_learning_rate = 0.0001
         self.gamma = 0.995
-        self.batch_size = 256
-        self.replay_size = 1000000
-        self.learning_steps = 10000
+        self.batch_size = int(batch_size)
+        self.replay_size = int(replay_size)
+        self.updates_per_step = max(1, int(updates_per_step))
+        self.learning_steps = 50_000
+        self.random_explore_steps = 50_000
         self.latent_dim = 50
+
+        # Transition-capped episodic replay (HER-compatible)
+        self.replay_buffer = GlobalEpisodicReplayBuffer(max_transitions=self.replay_size)
 
         joint_dim = env.single_observation_space["joints"].shape[0]
         act_dim = env.single_action_space.shape[0]
@@ -269,7 +279,9 @@ class SACAgent():
         self.actor_optim.step()
 
         # Update alpha during Actor loop 
-        alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
+        # Below was very unstable changed to alpha trick
+        # alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
+        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
 
         self.alpha_optim.zero_grad()
         alpha_loss.backward()
@@ -277,45 +289,96 @@ class SACAgent():
 
         return actor_loss.item(), alpha_loss.item()
 
+    # def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
+    #     # Calculate distances based purely on historical buffer data or HER injected goals.
+    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
+    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
+    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+
+    #     reward = 0.0
+
+    #     # Stage 1: place red close enough before emphasizing blue stacking.
+    #     if dist_place_red > self.stage_tolerance:
+    #         reward -= (5.0 * dist_grab_red)
+    #         if dist_grab_red < self.grab_tolerance:
+    #             reward -= (10.0 * dist_place_red)
+    #             reward += 1.0
+
+    #     # Stage 2: reward blue block pickup and stack onto red target.
+    #     else:
+    #         reward += 5.0
+    #         reward -= (5.0 * dist_grab_blue)
+
+    #         if dist_grab_blue < self.grab_tolerance:
+    #             reward -= (10.0 * dist_stack_blue)
+    #             reward += 1.0
+
+    #     is_success = bool(
+    #         dist_place_red < self.success_tolerance
+    #         and dist_stack_blue < self.success_tolerance
+    #     )
+    #     if is_success:
+    #         reward += 50.0
+
+    #     action_penalty = np.sum(np.square(action)) * 0.001
+    #     reward -= action_penalty
+
+    #     return reward / 10.0, is_success
+
+    # Stage based sparse reward function
+    # def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
+    #     dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
+    #     dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+    #     dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
+    #     dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+
+    #     red_stage_done = dist_place_red < self.stage_tolerance
+    #     red_success = dist_place_red < self.success_tolerance
+    #     blue_success = dist_stack_blue < self.success_tolerance
+    #     is_success = bool(red_success and blue_success)
+
+    #     reward = 0.0
+
+    #     reward -= 2.0 * dist_grab_red
+    #     reward -= 1.0 * dist_grab_blue
+
+    #     if not red_stage_done:
+    #         reward -= 8.0 * dist_place_red
+    #         if dist_grab_red < self.grab_tolerance:
+    #             reward += 1.0
+    #     else:
+    #         reward += 3.0
+    #         reward -= 8.0 * dist_stack_blue
+    #         if dist_grab_blue < self.grab_tolerance:
+    #             reward += 1.0
+
+    #     if red_success:
+    #         reward += 2.0
+    #     if blue_success:
+    #         reward += 2.0
+
+    #     if is_success:
+    #         reward += 30.0
+
+    #     action_penalty = 0.001 * np.sum(np.square(action))
+    #     reward -= action_penalty
+
+    #     return float(reward), is_success
+
     def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-        # Calculate distances based purely on historical buffer data or HER injected goals.
-        dist_grab_red = np.linalg.norm(gripper_pos - red_block_pos)
-        dist_place_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-        dist_grab_blue = np.linalg.norm(gripper_pos - blue_block_pos)
-        dist_stack_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+        dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+        dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
 
-        reward = 0.0
+        red_success = dist_red < self.success_tolerance
+        blue_success = dist_blue < self.success_tolerance
+        is_success = bool(red_success and blue_success)
 
-        # Stage 1: place red close enough before emphasizing blue stacking.
-        if dist_place_red > self.stage_tolerance:
-            reward -= (5.0 * dist_grab_red)
-            if dist_grab_red < self.grab_tolerance:
-                reward -= (10.0 * dist_place_red)
-                reward += 1.0
-
-        # Stage 2: reward blue block pickup and stack onto red target.
-        else:
-            reward += 5.0
-            reward -= (5.0 * dist_grab_blue)
-
-            if dist_grab_blue < self.grab_tolerance:
-                reward -= (10.0 * dist_stack_blue)
-                reward += 1.0
-
-        is_success = bool(
-            dist_place_red < self.success_tolerance
-            and dist_stack_blue < self.success_tolerance
-        )
-        if is_success:
-            reward += 50.0
-
-        action_penalty = np.sum(np.square(action)) * 0.001
-        reward -= action_penalty
-
-        return reward / 10.0, is_success
+        reward = 0.0 if is_success else -1.0
+        return float(reward), is_success
 
     def _compute_reward_numpy(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
-        reward, _ = self._compute_reward_and_success(
+        reward, success = self._compute_reward_and_success(
             gripper_pos=gripper_pos,
             red_block_pos=red_block_pos,
             blue_block_pos=blue_block_pos,
@@ -323,7 +386,7 @@ class SACAgent():
             target_top_pos=target_top_pos,
             action=action,
         )
-        return float(reward)
+        return float(reward), success
 
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action):
         return self._compute_reward_and_success(
@@ -337,8 +400,9 @@ class SACAgent():
         
     def sample(self):
         if self.replay_buffer.get_total_episodes() == 0:
-            print("Replay buffer is empty")
-            return
+            return None
+        if self.replay_buffer.get_total_timesteps() < self.batch_size:
+            return None
         
         episodes = list(self.replay_buffer.buffer) # To make mutable
         lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
@@ -391,7 +455,7 @@ class SACAgent():
                 #     action=action,
                 # )
 
-                reward = self._compute_reward_numpy(
+                reward, success = self._compute_reward_numpy(
                     gripper_pos=next_obs_joints[-15:-12],
                     red_block_pos=next_obs_joints[-12:-9],
                     blue_block_pos=next_obs_joints[-9:-6],
@@ -400,14 +464,17 @@ class SACAgent():
                     action=action,
                 )
 
+                reward = float(reward)
+                if success:
+                    done = 1.0
+
             obs_batch.append(obs_joints.astype(np.float32, copy=False))
             actions_batch.append(action)
             rewards_batch.append(np.float32(reward))
             next_obs_batch.append(next_obs_joints.astype(np.float32, copy=False))
             dones_batch.append(np.float32(done))
 
-        return (obs_batch, np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), next_obs_batch, np.asarray(dones_batch, dtype=np.float32))
-
+        return (np.stack(obs_batch, axis=0), np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), np.stack(next_obs_batch, axis=0), np.asarray(dones_batch, dtype=np.float32))
     # Modified existing load checkpoint code
     def load_checkpoint(self, model_path, timestep, load_critic=True):
         actor_path = os.path.join(model_path, "Actor", str(timestep))
@@ -489,13 +556,21 @@ class SACAgent():
         try: 
             for global_step in range(start_timestep, start_timestep + self.total_timesteps):
                 # Get next action for current state in the episode
-                with torch.no_grad():
-                    mean, log_sd = self.Actor(fused_obs)
-                    sd = log_sd.exp()
-                    normal = Normal(mean, sd)
-                    x = normal.rsample()
-                    action = torch.tanh(x)
-                    actions_np = action.cpu().numpy()
+                total_env_steps = global_step * n_envs
+
+                # Adding random warmup to add diverse trajectories to replay buffer
+                if total_env_steps < self.random_explore_steps:
+                    low = self.env.single_action_space.low
+                    high = self.env.single_action_space.high
+                    actions_np = np.random.uniform(low=low, high=high, size=(n_envs, low.shape[0])).astype(np.float32)
+                else:
+                    with torch.no_grad():
+                        mean, log_sd = self.Actor(fused_obs)
+                        sd = log_sd.exp()
+                        normal = Normal(mean, sd)
+                        x = normal.rsample()
+                        action = torch.tanh(x)
+                        actions_np = action.cpu().numpy()
 
                 raw_next_obs, reward, terminated, truncated, infos = self.env.step(actions_np)
                 with torch.no_grad():
@@ -503,6 +578,7 @@ class SACAgent():
 
                 # done if either terminated or truncated
                 dones = np.logical_or(terminated, truncated)
+                terminated_mask = terminated.astype(np.float32) 
                 episode_rewards += reward
 
                 # Info for each timestep
@@ -550,7 +626,7 @@ class SACAgent():
                     if "final_observation" in infos and infos.get("_final_observation", [False] * n_envs)[i]:
                         final_obs = infos["final_observation"][i]
                         next_obs_joints = final_obs["joints"].astype(np.float32, copy=True)
-                    step = StepInfo(obs_raw=obs_joints.copy(), action=actions_np[i], reward=reward[i], next_obs_raw=next_obs_joints, done=dones[i])
+                    step = StepInfo(obs_raw=obs_joints.copy(), action=actions_np[i], reward=reward[i], next_obs_raw=next_obs_joints, done=terminated_mask[i]) # Only storing if episode terminated
                     local_replay_buffer[i].append(step)
 
                 env_episode_timesteps += 1
@@ -605,39 +681,45 @@ class SACAgent():
 
 
                 # Training
-                if self.replay_buffer.get_total_timesteps() > self.learning_steps: # Let buffer fill up before learning
-                    obs_joints_, actions_, rewards_, next_obs_joints_, dones_ = self.sample()
+                if (self.replay_buffer.get_total_timesteps() > self.learning_steps and (global_step * n_envs) >= self.random_explore_steps):
+                    for _ in range(self.updates_per_step):
+                        batch = self.sample()
+                        if batch is None:
+                            break
 
-                    obs_batch = {"joints": obs_joints_}
-                    next_obs_batch = {"joints": next_obs_joints_}
+                        obs_joints_, actions_, rewards_, next_obs_joints_, dones_ = batch
 
-                    # Convert numpy values to tensors
-                    tensor_obs = self.fuse_observations(obs_batch, detach_encoder=False)
-                    tensor_next_obs = self.fuse_observations(next_obs_batch, detach_encoder=False)
-                    tensor_actions = torch.as_tensor(np.array(actions_), dtype=torch.float32, device=self.device)
-                    tensor_reward = torch.as_tensor(np.array(rewards_), dtype=torch.float32, device=self.device).view(-1, 1)
-                    tensor_dones = torch.as_tensor(np.array(dones_), dtype=torch.float32, device=self.device).view(-1, 1)
+                        obs_batch = {"joints": obs_joints_}
+                        next_obs_batch = {"joints": next_obs_joints_}
+
+                        # Convert numpy values to tensors
+                        tensor_obs = self.fuse_observations(obs_batch, detach_encoder=False)
+                        tensor_next_obs = self.fuse_observations(next_obs_batch, detach_encoder=False)
+                        tensor_actions = torch.as_tensor(actions_, dtype=torch.float32, device=self.device)
+                        tensor_reward = torch.as_tensor(rewards_, dtype=torch.float32, device=self.device).view(-1, 1)
+                        tensor_dones = torch.as_tensor(dones_, dtype=torch.float32, device=self.device).view(-1, 1)
 
 
-                    # Training Critic
-                    critic_loss = self.update_critic(tensor_next_obs, tensor_obs, tensor_actions, tensor_reward, tensor_dones)
+                        # Training Critic
+                        critic_loss = self.update_critic(tensor_next_obs, tensor_obs, tensor_actions, tensor_reward, tensor_dones)
 
-                    # Train Actor: need to compare to newly updated critic
-                    actor_loss, alpha_loss = self.update_actor(tensor_obs.detach())
+                        # Train Actor: need to compare to newly updated critic
+                        actor_loss, alpha_loss = self.update_actor(tensor_obs.detach())
 
-                    critic_loss_history.append(critic_loss)
-                    actor_loss_history.append(actor_loss)
-                    alpha_loss_history.append(alpha_loss)
+                        critic_loss_history.append(critic_loss)
+                        actor_loss_history.append(actor_loss)
+                        alpha_loss_history.append(alpha_loss)
 
-                    # Soft update the TargetCritic 
-                    for target_param, local_param in zip(self.TargetCritic.parameters(), self.Critic.parameters()):
-                        target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
+                        # Soft update the TargetCritic 
+                        for target_param, local_param in zip(self.TargetCritic.parameters(), self.Critic.parameters()):
+                            target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
                 
                 raw_obs = raw_next_obs
                 fused_obs = fused_next_obs.detach()
 
                 # Save model after certain amout of timesteps
-                if global_step % save_timesteps == 0 or (len(episode_returns) > 10 and np.mean(episode_returns[-10:]) >= 0):
+                # if global_step % save_timesteps == 0 or (len(episode_returns) > 10 and np.mean(episode_returns[-10:]) >= 0):
+                if global_step % save_timesteps == 0:
                     torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}")
                     torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}")
                     if self.encoder is not None:
@@ -649,9 +731,21 @@ class SACAgent():
                         },
                         f"{alpha_dir}/{global_step}",
                     )
-                    if len(episode_returns) > 10 and np.mean(episode_returns[-10:]) >= 0:
-                        print("max reward achieved")
-                        break
+                target_success_rate = 0.80
+                if len(success_history) == success_history.maxlen and float(np.mean(success_history)) >= target_success_rate:
+                    torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}_solved")
+                    torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}_solved")
+                    if self.encoder is not None:
+                        torch.save(self.encoder.state_dict(), f"{encoder_dir}/{global_step}_solved")
+                    torch.save(
+                        {
+                            "log_alpha": self.log_alpha.detach().cpu(),
+                            "alpha_optim": self.alpha_optim.state_dict(),
+                        },
+                        f"{alpha_dir}/{global_step}_solved",
+                    )
+                    print(f"target success achieved: {np.mean(success_history):.3f}")
+                    break
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving current state...")
             # Save with the current global_step or a specific "interrupted" suffix
@@ -670,20 +764,47 @@ class SACAgent():
             print(f"Models saved at step {global_step}. Exiting.")
 
 
+# class GlobalEpisodicReplayBuffer:
+#     def __init__(self, max_episodes):
+#         self.buffer = deque(maxlen=max_episodes)
+#         self.episode_lengths = deque(maxlen=max_episodes)
+
+#     def add_episode(self, episode_steps):
+#         """Appends a fully completed episode to the global buffer."""
+#         # Append the entire list of steps as a new inner list (Inner 2D/3D)
+#         self.buffer.append(episode_steps)
+#         # Track the length
+#         self.episode_lengths.append(len(episode_steps))
+
+#     def get_total_episodes(self):
+#         return len(self.buffer)
+    
+#     def get_total_timesteps(self):
+#         return int(sum(self.episode_lengths))
+
 class GlobalEpisodicReplayBuffer:
-    def __init__(self, max_episodes):
-        self.buffer = deque(maxlen=max_episodes)
-        self.episode_lengths = deque(maxlen=max_episodes)
+    def __init__(self, max_transitions):
+        self.max_transitions = int(max_transitions)
+        self.buffer = deque()
+        self.episode_lengths = deque()
+        self.total_transitions = 0
 
     def add_episode(self, episode_steps):
-        """Appends a fully completed episode to the global buffer."""
-        # Append the entire list of steps as a new inner list (Inner 2D/3D)
+        if not episode_steps:
+            return
+
+        ep_len = len(episode_steps)
         self.buffer.append(episode_steps)
-        # Track the length
-        self.episode_lengths.append(len(episode_steps))
+        self.episode_lengths.append(ep_len)
+        self.total_transitions += ep_len
+
+        while self.total_transitions > self.max_transitions and len(self.buffer) > 0:
+            old_len = self.episode_lengths.popleft()
+            self.buffer.popleft()
+            self.total_transitions -= old_len
 
     def get_total_episodes(self):
         return len(self.buffer)
-    
+
     def get_total_timesteps(self):
-        return int(sum(self.episode_lengths))
+        return int(self.total_transitions)
