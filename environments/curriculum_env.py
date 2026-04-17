@@ -81,23 +81,43 @@ class S0100Env(MujocoEnv):
         }
 
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos):
-        # REACH: Move gripper to target
+        dense_coef = 0.30
+        dense_scale = 8.0
+
+        # REACH
         if self.task_stage == 1:
-            dist = np.linalg.norm(gripper_pos - target_bottom_pos)
-            is_success = bool(dist < self.success_tolerance)
-        
-        # PUSH / PICK & PLACE: Red block to target (ignore blue)
-        elif self.task_stage == 2 or self.task_stage == 3:
-            dist = np.linalg.norm(red_block_pos - target_bottom_pos)
-            is_success = bool(dist < self.success_tolerance)
-        
-        # STACK: Both blocks to their targets
-        elif self.task_stage == 4:
+            goal_dist = np.linalg.norm(gripper_pos - target_bottom_pos)
+            is_success = bool(goal_dist < self.success_tolerance)
+
+        # PUSH / PICK & PLACE
+        elif self.task_stage in (2, 3):
+            dist_gripper_to_red = np.linalg.norm(gripper_pos - red_block_pos)
+            dist_red_to_target = np.linalg.norm(red_block_pos - target_bottom_pos)
+            
+            # Agent is rewarded for moving gripper to block, AND block to target.
+            goal_dist = dist_gripper_to_red + dist_red_to_target
+            is_success = bool(dist_red_to_target < self.success_tolerance)
+
+        # STACK
+        else:
+            # Assuming red goes to bottom target, blue goes to top target.
+            # You might also want a gripper_to_blue term here depending on task complexity.
             dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
             dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-            is_success = bool((dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance))
+            
+            # Sum distances so gradients flow for both blocks simultaneously.
+            goal_dist = (dist_red + dist_blue) / 2.0 
+            is_success = bool(
+                (dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance)
+            )
 
-        reward = 0.0 if is_success else -1.0
+        # Sparse terminal reward + small HER-friendly dense shaping.
+        if is_success:
+            reward = 0.0
+        else:
+            # Exponential shaping bounds the penalty nicely.
+            reward = -1.0 + dense_coef * np.exp(-dense_scale * goal_dist)
+
         return float(reward), is_success
         
     def step(self, action):
@@ -181,32 +201,28 @@ class S0100Env(MujocoEnv):
         blue_qpos_idx = self.model.jnt_qposadr[self.blue_joint_id]
 
 
-        if self.task_stage == 1 or self.task_stage == 3:
-            # REACH & PICK: Target is a random point in the air (5cm to 20cm up)
-            target_z = float(self.np_random.uniform(0.05, 0.20))
-        else:
-            # PUSH & STACK: Target is flat on the table
-            target_z = table_z
-
-        # Move the static target body in the MuJoCo model
-        self.model.body_pos[self.target_body_id] = np.array([target_x, target_y, target_z])
-
-        # Hide objects that aren't part of the current stage
         if self.task_stage < 4:
-            # Hide the blue block (Stages 1, 2, 3)
-            qpos[blue_qpos_idx : blue_qpos_idx + 3] = np.array([10.0, 10.0, -2.0]) 
+            if self.task_stage in (1, 3):
+                # REACH & PICK: random point in the air
+                target_z = float(self.np_random.uniform(0.05, 0.20))
+            else:
+                # PUSH: target on the table
+                target_z = table_z
+            self.model.body_pos[self.target_body_id] = np.array([target_x, target_y, target_z])
+
+            # Hide blue in stages 1-3
+            qpos[blue_qpos_idx : blue_qpos_idx + 3] = np.array([10.0, 10.0, -2.0])
             qvel[blue_qpos_idx : blue_qpos_idx + 3] = 0.0
-            
-        if self.task_stage == 1:
-            # Hide the red block (Stage 1 only)
-            qpos[red_qpos_idx : red_qpos_idx + 3] = np.array([-10.0, -10.0, -2.0])
-            qvel[red_qpos_idx : red_qpos_idx + 3] = 0.0
-        else:
-            # Stages 2, 3, 4: Spawn red block randomly on the table
-            # (Prevents agent from memorizing the 0.15, 0.15 start pos)
-            qpos[red_qpos_idx] = self.np_random.uniform(0.10, 0.30)     # X
-            qpos[red_qpos_idx + 1] = self.np_random.uniform(-0.20, 0.20)  # Y
-            qpos[red_qpos_idx + 2] = table_z
+
+            if self.task_stage == 1:
+                # Hide red in stage 1
+                qpos[red_qpos_idx : red_qpos_idx + 3] = np.array([-10.0, -10.0, -2.0])
+                qvel[red_qpos_idx : red_qpos_idx + 3] = 0.0
+            else:
+                # Stages 2-3: randomize red on table
+                qpos[red_qpos_idx] = float(self.np_random.uniform(0.10, 0.30))
+                qpos[red_qpos_idx + 1] = float(self.np_random.uniform(-0.20, 0.20))
+                qpos[red_qpos_idx + 2] = table_z
 
         # Set the state with the noisy positions
         self.set_state(qpos, qvel)
@@ -232,6 +248,20 @@ class S0100Env(MujocoEnv):
         vec_red_to_target = target_bottom_pos - red_block_pos
         vec_gripper_to_blue = blue_block_pos - tip_pos
         vec_blue_to_target = target_top_pos - blue_block_pos
+
+        zero_vec = np.zeros(3, dtype=np.float32)
+
+        # Mask specific observations depending on current stage so they don't effect training
+        if self.task_stage == 1:
+            vec_gripper_to_red = zero_vec.copy()
+            vec_red_to_target = zero_vec.copy()
+            red_block_pos = zero_vec.copy()
+
+        if self.task_stage < 4:
+            vec_gripper_to_blue = zero_vec.copy()
+            vec_blue_to_target = zero_vec.copy()
+            blue_block_pos = zero_vec.copy()
+            target_top_pos = zero_vec.copy()
 
         joint_obs = np.concatenate([
             joint_positions,             

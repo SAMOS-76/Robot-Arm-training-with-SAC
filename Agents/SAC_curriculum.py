@@ -52,11 +52,15 @@ class CriticNetworks(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1)
         )
 
         self.network2 = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -297,23 +301,43 @@ class SACAgent():
         return actor_loss.item(), alpha_loss.item()
 
     def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action=None):
-        # REACH: Move gripper to target
+        dense_coef = 0.30
+        dense_scale = 8.0
+
+        # REACH
         if self.task_stage == 1:
-            dist = np.linalg.norm(gripper_pos - target_bottom_pos)
-            is_success = bool(dist < self.success_tolerance)
-        
-        # PUSH / PICK & PLACE: Red block to target (ignore blue)
-        elif self.task_stage == 2 or self.task_stage == 3:
-            dist = np.linalg.norm(red_block_pos - target_bottom_pos)
-            is_success = bool(dist < self.success_tolerance)
-        
-        # STACK: Both blocks to their targets
-        elif self.task_stage == 4:
+            goal_dist = np.linalg.norm(gripper_pos - target_bottom_pos)
+            is_success = bool(goal_dist < self.success_tolerance)
+
+        # PUSH / PICK & PLACE
+        elif self.task_stage in (2, 3):
+            dist_gripper_to_red = np.linalg.norm(gripper_pos - red_block_pos)
+            dist_red_to_target = np.linalg.norm(red_block_pos - target_bottom_pos)
+            
+            # Agent is rewarded for moving gripper to block, AND block to target.
+            goal_dist = dist_gripper_to_red + dist_red_to_target
+            is_success = bool(dist_red_to_target < self.success_tolerance)
+
+        # STACK
+        else:
+            # Assuming red goes to bottom target, blue goes to top target.
+            # You might also want a gripper_to_blue term here depending on task complexity.
             dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
             dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-            is_success = bool((dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance))
+            
+            # Sum distances so gradients flow for both blocks simultaneously.
+            goal_dist = (dist_red + dist_blue) / 2.0 
+            is_success = bool(
+                (dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance)
+            )
 
-        reward = 0.0 if is_success else -1.0
+        # Sparse terminal reward + small HER-friendly dense shaping.
+        if is_success:
+            reward = 0.0
+        else:
+            # Exponential shaping bounds the penalty nicely.
+            reward = -1.0 + dense_coef * np.exp(-dense_scale * goal_dist)
+
         return float(reward), is_success
 
         
@@ -324,9 +348,14 @@ class SACAgent():
             return None
         
         episodes = list(self.replay_buffer.buffer) # To make mutable
-        lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
-        probs = lengths / lengths.sum()
-        episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True, p=probs) # Weighted sampling to prioritise sampling from longer eps
+
+        # Weighted sampling to prioritise sampling from longer eps
+        # lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
+        # probs = lengths / lengths.sum()
+        # episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True, p=probs) 
+
+        # Uniform sampling so it doesn't emphasise possible failed trajectories at end of episodes
+        episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True)
         HER_masking = np.random.rand(self.batch_size) < 0.8
 
         obs_batch = []
@@ -356,20 +385,31 @@ class SACAgent():
 
                 if self.task_stage == 1:
                     new_goal[:3] = future_obs[-15:-12].copy()
+                    new_goal[3:] = 0.0
                 elif self.task_stage in (2, 3):
                     new_goal[:3] = future_obs[-12:-9].copy()
+                    new_goal[3:] = 0.0
                 else:
                     new_goal[:3] = future_obs[-12:-9].copy()
                     new_goal[3:] = future_obs[-9:-6].copy()
 
-                # Chaning old goals with new goals
+                # Change old goals with new goals
                 obs_joints[-6:] = new_goal
                 next_obs_joints[-6:] = new_goal
                 # Cause I've changed the goals I also need to change the distance vectors in the obs
-                obs_joints[15:18] = new_goal[:3] - obs_joints[-12:-9]
-                obs_joints[21:24] = new_goal[3:] - obs_joints[-9:-6]
-                next_obs_joints[15:18] = new_goal[:3] - next_obs_joints[-12:-9]
-                next_obs_joints[21:24] = new_goal[3:] - next_obs_joints[-9:-6]
+                if self.task_stage == 1:
+                    obs_joints[15:18] = 0.0
+                    next_obs_joints[15:18] = 0.0
+                else:
+                    obs_joints[15:18] = new_goal[:3] - obs_joints[-12:-9]
+                    next_obs_joints[15:18] = new_goal[:3] - next_obs_joints[-12:-9]
+
+                if self.task_stage == 4:
+                    obs_joints[21:24] = new_goal[3:] - obs_joints[-9:-6]
+                    next_obs_joints[21:24] = new_goal[3:] - next_obs_joints[-9:-6]
+                else:
+                    obs_joints[21:24] = 0.0
+                    next_obs_joints[21:24] = 0.0
 
                 reward, success = self._compute_reward_and_success(
                     gripper_pos=next_obs_joints[-15:-12],
@@ -393,14 +433,90 @@ class SACAgent():
         return (np.stack(obs_batch, axis=0), np.stack(actions_batch, axis=0), np.asarray(rewards_batch, dtype=np.float32), np.stack(next_obs_batch, axis=0), np.asarray(dones_batch, dtype=np.float32))
 
     # Modified existing load checkpoint code
-    def load_checkpoint(self, model_path, timestep, load_critic=True):
-        actor_path = os.path.join(model_path, "Actor", str(timestep))
-        critic_path = os.path.join(model_path, "Critic", str(timestep))
-        encoder_path = os.path.join(model_path, "Encoder", str(timestep))
-        alpha_path = os.path.join(model_path, "Alpha", str(timestep))
+    # NOTE: Should I load a new critic and alpha each stage? Difficult for critic to unlearn if the environment states are too different
+    # def load_checkpoint(self, model_path, timestep, load_critic=True):
+    #     actor_path = os.path.join(model_path, "Actor", str(timestep))
+    #     critic_path = os.path.join(model_path, "Critic", str(timestep))
+    #     encoder_path = os.path.join(model_path, "Encoder", str(timestep))
+    #     alpha_path = os.path.join(model_path, "Alpha", str(timestep))
 
-        if not os.path.isfile(actor_path):
-            raise FileNotFoundError(f"Actor checkpoint not found: {actor_path}")
+    #     if not os.path.isfile(actor_path):
+    #         raise FileNotFoundError(f"Actor checkpoint not found: {actor_path}")
+
+    #     actor_state = torch.load(actor_path, map_location=self.device)
+    #     self.Actor.load_state_dict(actor_state)
+
+    #     if load_critic:
+    #         if not os.path.isfile(critic_path):
+    #             raise FileNotFoundError(f"Critic checkpoint not found: {critic_path}")
+    #         critic_state = torch.load(critic_path, map_location=self.device)
+    #         self.Critic.load_state_dict(critic_state)
+    #         self.TargetCritic.load_state_dict(self.Critic.state_dict())
+
+    #     if self.encoder is not None:
+    #         if os.path.isfile(encoder_path):
+    #             encoder_state = torch.load(encoder_path, map_location=self.device)
+    #             self.encoder.load_state_dict(encoder_state)
+    #         else:
+    #             print(f"[WARN] Encoder checkpoint not found: {encoder_path}. Using current encoder weights.")
+
+    #     if load_critic and os.path.isfile(alpha_path):
+    #         alpha_state = torch.load(alpha_path, map_location=self.device)
+    #         if "log_alpha" in alpha_state:
+    #             self.log_alpha.data.copy_(alpha_state["log_alpha"].to(self.device))
+    #         if "alpha_optim" in alpha_state:
+    #             self.alpha_optim.load_state_dict(alpha_state["alpha_optim"])
+
+    #     print(f"Loaded checkpoint at timestep {timestep}")
+
+    def load_checkpoint(self, model_path, timestep, load_critic=True):
+        actor_dir = os.path.join(model_path, "Actor")
+        critic_dir = os.path.join(model_path, "Critic")
+        encoder_dir = os.path.join(model_path, "Encoder")
+        alpha_dir = os.path.join(model_path, "Alpha")
+
+        def _resolve_checkpoint_file(folder, step):
+            # Prefer solved file, then plain, then interrupted.
+            preferred = [f"{step}_solved", str(step), f"{step}_interrupted"]
+            for name in preferred:
+                path = os.path.join(folder, name)
+                if os.path.isfile(path):
+                    return path
+
+            # Fallback: any file starting with the numeric step.
+            prefix = f"{step}"
+            candidates = []
+            if os.path.isdir(folder):
+                for name in os.listdir(folder):
+                    if not name.startswith(prefix):
+                        continue
+                    path = os.path.join(folder, name)
+                    if os.path.isfile(path):
+                        # Prefer solved > plain > interrupted > other.
+                        if name.endswith("_solved"):
+                            rank = 3
+                        elif name == str(step):
+                            rank = 2
+                        elif name.endswith("_interrupted"):
+                            rank = 1
+                        else:
+                            rank = 0
+                        candidates.append((rank, name, path))
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            return candidates[0][2]
+
+        actor_path = _resolve_checkpoint_file(actor_dir, timestep)
+        if actor_path is None:
+            raise FileNotFoundError(f"Actor checkpoint not found for step {timestep} in: {actor_dir}")
+
+        checkpoint_name = os.path.basename(actor_path)
+        critic_path = os.path.join(critic_dir, checkpoint_name)
+        encoder_path = os.path.join(encoder_dir, checkpoint_name)
+        alpha_path = os.path.join(alpha_dir, checkpoint_name)
 
         actor_state = torch.load(actor_path, map_location=self.device)
         self.Actor.load_state_dict(actor_state)
@@ -419,16 +535,17 @@ class SACAgent():
             else:
                 print(f"[WARN] Encoder checkpoint not found: {encoder_path}. Using current encoder weights.")
 
-        if os.path.isfile(alpha_path):
+        if load_critic and os.path.isfile(alpha_path):
             alpha_state = torch.load(alpha_path, map_location=self.device)
             if "log_alpha" in alpha_state:
                 self.log_alpha.data.copy_(alpha_state["log_alpha"].to(self.device))
             if "alpha_optim" in alpha_state:
                 self.alpha_optim.load_state_dict(alpha_state["alpha_optim"])
 
-        print(f"Loaded checkpoint at timestep {timestep}")
+        print(f"Loaded checkpoint: {checkpoint_name}")
 
-    def train(self, model_path, save_timesteps=50000, start_timestep=0):
+    def train(self, model_path, save_timesteps=50000, start_timestep=0, target_success_rate=0.9):
+        task_solved = False
         actor_dir = os.path.join(model_path, "Actor")
         critic_dir = os.path.join(model_path, "Critic")
         encoder_dir = os.path.join(model_path, "Encoder")
@@ -591,7 +708,7 @@ class SACAgent():
 
                         if (episode_count % self.log_every_episodes == 0) or (success_i > 0.5):
                             print(
-                                f"[{formatted_time}] Step: {total_env_steps} | SPS: {sps} | Ep: {episode_count}\n"
+                                f"[{formatted_time}] Step: {total_env_steps} | SPS: {sps} | Ep: {episode_count} | Stage: {self.task_stage}\n"
                                 f"    ├─ Returns: Current={ret:.2f} | Avg(10)={ret10:.2f} | Succ(100)={succ100:.2f}\n"
                                 f"    ├─ Metrics: {metrics_summary}\n"
                                 f"    └─ Network: C_Loss={c_loss_avg:.3f} | A_Loss={a_loss_avg:.3f} | Alpha={alpha_val:.4f}\n"
@@ -650,7 +767,6 @@ class SACAgent():
                         },
                         f"{alpha_dir}/{global_step}",
                     )
-                target_success_rate = 0.80
                 if len(success_history) == success_history.maxlen and float(np.mean(success_history)) >= target_success_rate:
                     torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}_solved")
                     torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}_solved")
@@ -664,6 +780,7 @@ class SACAgent():
                         f"{alpha_dir}/{global_step}_solved",
                     )
                     print(f"target success achieved: {np.mean(success_history):.3f}")
+                    task_solved = True
                     break
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving current state...")
@@ -681,6 +798,8 @@ class SACAgent():
                 f"{alpha_dir}/{global_step}_interrupted",
             )
             print(f"Models saved at step {global_step}. Exiting.")
+
+        return task_solved
 
 class GlobalEpisodicReplayBuffer:
     def __init__(self, max_transitions):

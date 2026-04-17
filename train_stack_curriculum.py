@@ -34,10 +34,12 @@ def _latest_actor_step(models_dir):
     return latest
 
 
-def run_stage(args, device, models_dir, task_stage, resume_step):
+def run_stage(args, device, models_dir, task_stage, resume_step, load_critic_on_resume=False):
+    stage_hold_steps = args.stack_success_hold_steps if task_stage == 4 else args.success_hold_steps
+    stage_success_threshold = args.stack_success_threshold if task_stage == 4 else args.base_success_threshold
     num_envs = args.num_envs
     env = gym.vector.AsyncVectorEnv(
-        [make_env(args.episode_steps, args.success_hold_steps, task_stage) for _ in range(num_envs)]
+        [make_env(args.episode_steps, stage_hold_steps, task_stage) for _ in range(num_envs)]
     )
 
     model = SACAgent(
@@ -50,17 +52,34 @@ def run_stage(args, device, models_dir, task_stage, resume_step):
         updates_per_step=args.updates_per_step,
     )
 
+    # Need to vary warmup and learning steps depending on stage cause later stages need less warmup 
+    if task_stage == 1:
+        warmup_scale = 1.0
+    elif task_stage in (2, 3):
+        warmup_scale = args.stage23_warmup_scale
+    else:
+        warmup_scale = args.stage4_warmup_scale
+
+    model.random_explore_steps = max(args.batch_size, int(model.random_explore_steps * warmup_scale))
+    model.learning_steps = max(args.batch_size, int(model.learning_steps * warmup_scale))
+
+    print(
+        f"Stage {task_stage} schedule | "
+        f"random_explore_steps={model.random_explore_steps} | "
+        f"learning_steps={model.learning_steps}"
+    )
+
     start_timestep = 0
     if resume_step is not None:
-        model.load_checkpoint(models_dir, resume_step, load_critic=args.resume_load_critic)
+        model.load_checkpoint(models_dir, resume_step, load_critic=load_critic_on_resume)
         start_timestep = resume_step
 
     try:
-        model.train(models_dir, save_timesteps=args.save_timesteps, start_timestep=start_timestep)
+        stage_solved = model.train(models_dir, save_timesteps=args.save_timesteps, start_timestep=start_timestep, target_success_rate=stage_success_threshold)
     finally:
         env.close()
 
-    return _latest_actor_step(models_dir)
+    return _latest_actor_step(models_dir), stage_solved
 
 def main():
     parser = argparse.ArgumentParser()
@@ -76,6 +95,12 @@ def main():
     parser.add_argument("--updates-per-step", type=int, default=2, help="Gradient updates per env step")
     parser.add_argument("--curriculum-stages", type=int, nargs="+", choices=[1, 2, 3, 4], default=None, help="Optional stage sequence, e.g. --curriculum-stages 1 2 3 4")
     parser.add_argument("--resume-load-critic", action="store_true", help="When resuming, also load critic. Default is actor-only transfer.")
+    parser.add_argument("--base-success-threshold", type=float, default=0.90, help="Solved threshold for stages 1-3")
+    parser.add_argument("--stack-success-threshold", type=float, default=0.80, help="Solved threshold for stage 4")
+    parser.add_argument("--stack-success-hold-steps", type=int, default=5, help="Consecutive success steps required in stage 4")
+    parser.add_argument("--stage23-warmup-scale", type=float, default=0.50, help="Scale factor for random_explore_steps and learning_steps in stages 2-3")
+    parser.add_argument("--stage4-warmup-scale", type=float, default=0.35, help="Scale factor for random_explore_steps and learning_steps in stage 4")
+    parser.add_argument("--max-stage-attempts", type=int, default=0, help="0 means unlimited attempts per stage")
     args = parser.parse_args()
 
     models_dir = "models/SAC_stacking"
@@ -89,16 +114,27 @@ def main():
     if args.curriculum_stages:
         resume_step = args.resume_step
         for stage in args.curriculum_stages:
-            print(f"\n=== Curriculum stage {stage} ===")
-            resume_step = run_stage(
-                args=args,
-                device=device,
-                models_dir=models_dir,
-                task_stage=stage,
-                resume_step=resume_step,
-            )
-            if resume_step is None:
-                raise RuntimeError("No actor checkpoint found after stage run; cannot continue curriculum.")
+            attempt = 0
+            while True:
+                print(f"\n=== Curriculum stage {stage} | attempt {attempt + 1} ===")
+                load_critic_on_resume = args.resume_load_critic if attempt == 0 else True
+                resume_step, stage_solved = run_stage(
+                    args=args,
+                    device=device,
+                    models_dir=models_dir,
+                    task_stage=stage,
+                    resume_step=resume_step,
+                    load_critic_on_resume=load_critic_on_resume,
+                )
+                if resume_step is None:
+                    raise RuntimeError("No actor checkpoint found after stage run; cannot continue curriculum.")
+                if stage_solved:
+                    break
+                attempt += 1
+                if args.max_stage_attempts > 0 and attempt >= args.max_stage_attempts:
+                    print(f"Stage {stage} unsolved after {attempt} attempt(s). Stopping.")
+                    return
+                print(f"Stage {stage} not solved yet. Continuing same stage from step {resume_step}...")
     else:
         _ = run_stage(
             args=args,
@@ -106,6 +142,7 @@ def main():
             models_dir=models_dir,
             task_stage=args.task_stage,
             resume_step=args.resume_step,
+            load_critic_on_resume=args.resume_load_critic,
         )
 
 if __name__ == '__main__':
