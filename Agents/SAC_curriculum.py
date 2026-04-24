@@ -167,6 +167,7 @@ class SACAgent():
         self.target_entropy = -act_dim
 
         self.log_every_episodes = 10
+        self.schedule_env_steps = 0
 
         self.grab_tolerance = 0.025
         self.stage_tolerance = 0.03
@@ -205,6 +206,11 @@ class SACAgent():
             self.success_tolerance = env_success_tol
         if env_task_stage is not None:
             self.task_stage = int(env_task_stage)
+
+    def _reset_alpha(self, init_alpha=0.1):
+        with torch.no_grad():
+            self.log_alpha.data.fill_(np.log(float(init_alpha)))
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=0.0003)
 
     # Fuse joint and image observations if using image input
     def fuse_observations(self, obs, detach_encoder=False):
@@ -301,42 +307,69 @@ class SACAgent():
         return actor_loss.item(), alpha_loss.item()
 
     def _compute_reward_and_success(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos, action=None):
-        dense_coef = 0.30
-        dense_scale = 8.0
+        table_z = 0.02
 
         # REACH
         if self.task_stage == 1:
-            goal_dist = np.linalg.norm(gripper_pos - target_bottom_pos)
-            is_success = bool(goal_dist < self.success_tolerance)
+            dist_reach = np.linalg.norm(gripper_pos - target_bottom_pos)
+            is_success = bool(dist_reach < self.success_tolerance)
 
-        # PUSH / PICK & PLACE
-        elif self.task_stage in (2, 3):
+            if is_success:
+                reward = 0.0
+            else:
+                reach_term = 0.35 * np.exp(-7.0 * dist_reach)
+                reward = -1.0 + reach_term
+
+            return float(reward), is_success
+
+        # PUSH
+        if self.task_stage == 2:
             dist_gripper_to_red = np.linalg.norm(gripper_pos - red_block_pos)
             dist_red_to_target = np.linalg.norm(red_block_pos - target_bottom_pos)
-            
-            # Agent is rewarded for moving gripper to block, AND block to target.
-            goal_dist = dist_gripper_to_red + dist_red_to_target
             is_success = bool(dist_red_to_target < self.success_tolerance)
 
-        # STACK
-        else:
-            # Assuming red goes to bottom target, blue goes to top target.
-            # You might also want a gripper_to_blue term here depending on task complexity.
-            dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-            dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-            
-            # Sum distances so gradients flow for both blocks simultaneously.
-            goal_dist = (dist_red + dist_blue) / 2.0 
-            is_success = bool(
-                (dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance)
-            )
+            if is_success:
+                reward = 0.0
+            else:
+                reach_term = 0.20 * np.exp(-10.0 * dist_gripper_to_red)
+                push_term = 0.28 * np.exp(-8.0 * dist_red_to_target)
+                contact_term = 0.08 * np.exp(-40.0 * dist_gripper_to_red)
+                reward = -1.0 + reach_term + push_term + contact_term
 
-        # Sparse terminal reward + small HER-friendly dense shaping.
+            return float(reward), is_success
+
+        # PICK & PLACE
+        if self.task_stage == 3:
+            dist_gripper_to_red = np.linalg.norm(gripper_pos - red_block_pos)
+            dist_red_to_target = np.linalg.norm(red_block_pos - target_bottom_pos)
+            red_height = max(0.0, float(red_block_pos[2] - table_z))
+            is_success = bool(dist_red_to_target < self.success_tolerance)
+
+            if is_success:
+                reward = 0.0
+            else:
+                reach_term = 0.16 * np.exp(-10.0 * dist_gripper_to_red)
+                lift_term = 0.20 * np.clip(red_height / 0.06, 0.0, 1.0)
+                place_term = 0.30 * np.exp(-8.0 * dist_red_to_target)
+                reward = -1.0 + reach_term + lift_term + place_term
+
+            return float(reward), is_success
+
+        # STACK
+        dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+        dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+        dist_gripper_to_blue = np.linalg.norm(gripper_pos - blue_block_pos)
+        near_stack = bool((dist_red < self.stage_tolerance) and (dist_blue < self.stage_tolerance))
+        is_success = bool((dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance))
+
         if is_success:
             reward = 0.0
         else:
-            # Exponential shaping bounds the penalty nicely.
-            reward = -1.0 + dense_coef * np.exp(-dense_scale * goal_dist)
+            red_term = 0.18 * np.exp(-8.0 * dist_red)
+            blue_term = 0.24 * np.exp(-8.0 * dist_blue)
+            blue_reach_term = 0.10 * np.exp(-10.0 * dist_gripper_to_blue)
+            stack_hold_term = 0.08 if near_stack else 0.0
+            reward = -1.0 + red_term + blue_term + blue_reach_term + stack_hold_term
 
         return float(reward), is_success
 
@@ -349,13 +382,17 @@ class SACAgent():
         
         episodes = list(self.replay_buffer.buffer) # To make mutable
 
-        # Weighted sampling to prioritise sampling from longer eps
-        # lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
-        # probs = lengths / lengths.sum()
-        # episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True, p=probs) 
+        lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
+        uniform_probs = np.full(len(episodes), 1.0 / len(episodes), dtype=np.float64)
+        if lengths.sum() > 0.0:
+            length_probs = lengths / lengths.sum()
+        else:
+            length_probs = uniform_probs
 
-        # Uniform sampling so it doesn't emphasise possible failed trajectories at end of episodes
-        episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True)
+        # Hybrid replay sampling improves transition coverage without overfocusing on short episodes.
+        hybrid_alpha = 0.30
+        hybrid_probs = hybrid_alpha * uniform_probs + (1.0 - hybrid_alpha) * length_probs
+        episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True, p=hybrid_probs)
         HER_masking = np.random.rand(self.batch_size) < 0.8
 
         obs_batch = []
@@ -542,6 +579,9 @@ class SACAgent():
             if "alpha_optim" in alpha_state:
                 self.alpha_optim.load_state_dict(alpha_state["alpha_optim"])
 
+        if not load_critic:
+            self._reset_alpha(init_alpha=0.1)
+
         print(f"Loaded checkpoint: {checkpoint_name}")
 
     def train(self, model_path, save_timesteps=50000, start_timestep=0, target_success_rate=0.9):
@@ -585,11 +625,10 @@ class SACAgent():
 
         try: 
             for global_step in range(start_timestep, start_timestep + self.total_timesteps):
-                # Get next action for current state in the episode
-                total_env_steps = global_step * n_envs
+                schedule_env_steps_before = self.schedule_env_steps
 
                 # Adding random warmup to add diverse trajectories to replay buffer
-                if total_env_steps < self.random_explore_steps:
+                if schedule_env_steps_before < self.random_explore_steps:
                     low = self.env.single_action_space.low
                     high = self.env.single_action_space.high
                     actions_np = np.random.uniform(low=low, high=high, size=(n_envs, low.shape[0])).astype(np.float32)
@@ -605,6 +644,7 @@ class SACAgent():
                 raw_next_obs, reward, terminated, truncated, infos = self.env.step(actions_np)
                 with torch.no_grad():
                     fused_next_obs = self.fuse_observations(raw_next_obs)
+                self.schedule_env_steps += n_envs
 
                 # done if either terminated or truncated
                 dones = np.logical_or(terminated, truncated)
@@ -616,9 +656,15 @@ class SACAgent():
                 step_metrics = {}
 
                 def _set_metric_array(name, values):
+                    if isinstance(name, str) and name.startswith("_"):
+                        return
+
                     arr = np.asarray(values, dtype=np.float32)
                     if arr.ndim == 0:
                         arr = np.full(n_envs, float(arr), dtype=np.float32)
+                    elif arr.shape[0] != n_envs:
+                        return
+
                     step_metrics[name] = arr
 
                 if "success" in infos:
@@ -643,11 +689,17 @@ class SACAgent():
 
                             if "metrics" in final_info and isinstance(final_info["metrics"], dict):
                                 for name, value in final_info["metrics"].items():
+                                    if isinstance(name, str) and name.startswith("_"):
+                                        continue
+
                                     if name not in step_metrics:
                                         step_metrics[name] = np.full(n_envs, np.nan, dtype=np.float32)
                                     step_metrics[name][i] = float(value)
                             elif "distances" in final_info and isinstance(final_info["distances"], dict):
                                 for name, value in final_info["distances"].items():
+                                    if isinstance(name, str) and name.startswith("_"):
+                                        continue
+
                                     if name not in step_metrics:
                                         step_metrics[name] = np.full(n_envs, np.nan, dtype=np.float32)
                                     step_metrics[name][i] = float(value)
@@ -717,7 +769,7 @@ class SACAgent():
                             )
 
                 # Training
-                if (self.replay_buffer.get_total_timesteps() > self.learning_steps and (global_step * n_envs) >= self.random_explore_steps):
+                if (self.replay_buffer.get_total_timesteps() > self.learning_steps and self.schedule_env_steps >= self.random_explore_steps):
                     for _ in range(self.updates_per_step):
                         batch = self.sample()
                         if batch is None:

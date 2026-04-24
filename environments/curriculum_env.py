@@ -81,42 +81,69 @@ class S0100Env(MujocoEnv):
         }
 
     def compute_reward(self, gripper_pos, red_block_pos, blue_block_pos, target_bottom_pos, target_top_pos):
-        dense_coef = 0.30
-        dense_scale = 8.0
+        table_z = 0.02
 
         # REACH
         if self.task_stage == 1:
-            goal_dist = np.linalg.norm(gripper_pos - target_bottom_pos)
-            is_success = bool(goal_dist < self.success_tolerance)
+            dist_reach = np.linalg.norm(gripper_pos - target_bottom_pos)
+            is_success = bool(dist_reach < self.success_tolerance)
 
-        # PUSH / PICK & PLACE
-        elif self.task_stage in (2, 3):
+            if is_success:
+                reward = 0.0
+            else:
+                reach_term = 0.35 * np.exp(-7.0 * dist_reach)
+                reward = -1.0 + reach_term
+
+            return float(reward), is_success
+
+        # PUSH
+        if self.task_stage == 2:
             dist_gripper_to_red = np.linalg.norm(gripper_pos - red_block_pos)
             dist_red_to_target = np.linalg.norm(red_block_pos - target_bottom_pos)
-            
-            # Agent is rewarded for moving gripper to block, AND block to target.
-            goal_dist = dist_gripper_to_red + dist_red_to_target
             is_success = bool(dist_red_to_target < self.success_tolerance)
 
-        # STACK
-        else:
-            # Assuming red goes to bottom target, blue goes to top target.
-            # You might also want a gripper_to_blue term here depending on task complexity.
-            dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
-            dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
-            
-            # Sum distances so gradients flow for both blocks simultaneously.
-            goal_dist = (dist_red + dist_blue) / 2.0 
-            is_success = bool(
-                (dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance)
-            )
+            if is_success:
+                reward = 0.0
+            else:
+                reach_term = 0.20 * np.exp(-10.0 * dist_gripper_to_red)
+                push_term = 0.28 * np.exp(-8.0 * dist_red_to_target)
+                contact_term = 0.08 * np.exp(-40.0 * dist_gripper_to_red)
+                reward = -1.0 + reach_term + push_term + contact_term
 
-        # Sparse terminal reward + small HER-friendly dense shaping.
+            return float(reward), is_success
+
+        # PICK & PLACE
+        if self.task_stage == 3:
+            dist_gripper_to_red = np.linalg.norm(gripper_pos - red_block_pos)
+            dist_red_to_target = np.linalg.norm(red_block_pos - target_bottom_pos)
+            red_height = max(0.0, float(red_block_pos[2] - table_z))
+            is_success = bool(dist_red_to_target < self.success_tolerance)
+
+            if is_success:
+                reward = 0.0
+            else:
+                reach_term = 0.16 * np.exp(-10.0 * dist_gripper_to_red)
+                lift_term = 0.20 * np.clip(red_height / 0.06, 0.0, 1.0)
+                place_term = 0.30 * np.exp(-8.0 * dist_red_to_target)
+                reward = -1.0 + reach_term + lift_term + place_term
+
+            return float(reward), is_success
+
+        # STACK
+        dist_red = np.linalg.norm(red_block_pos - target_bottom_pos)
+        dist_blue = np.linalg.norm(blue_block_pos - target_top_pos)
+        dist_gripper_to_blue = np.linalg.norm(gripper_pos - blue_block_pos)
+        near_stack = bool((dist_red < self.stage_tolerance) and (dist_blue < self.stage_tolerance))
+        is_success = bool((dist_red < self.success_tolerance) and (dist_blue < self.success_tolerance))
+
         if is_success:
             reward = 0.0
         else:
-            # Exponential shaping bounds the penalty nicely.
-            reward = -1.0 + dense_coef * np.exp(-dense_scale * goal_dist)
+            red_term = 0.18 * np.exp(-8.0 * dist_red)
+            blue_term = 0.24 * np.exp(-8.0 * dist_blue)
+            blue_reach_term = 0.10 * np.exp(-10.0 * dist_gripper_to_blue)
+            stack_hold_term = 0.08 if near_stack else 0.0
+            reward = -1.0 + red_term + blue_term + blue_reach_term + stack_hold_term
 
         return float(reward), is_success
         
@@ -191,8 +218,6 @@ class S0100Env(MujocoEnv):
         # Add noise to the first 6 indices (the arm joints)
         qpos[self.control_qpos_ids] += self.np_random.uniform(low=noise_low, high=noise_high, size=self.n_actuators)
         
-        block_noise_range = 0.02
-
         target_x = float(self.np_random.uniform(0.10, 0.30))
         target_y = float(self.np_random.uniform(-0.20, 0.20))
         table_z = 0.02
@@ -223,6 +248,21 @@ class S0100Env(MujocoEnv):
                 qpos[red_qpos_idx] = float(self.np_random.uniform(0.10, 0.30))
                 qpos[red_qpos_idx + 1] = float(self.np_random.uniform(-0.20, 0.20))
                 qpos[red_qpos_idx + 2] = table_z
+        else:
+            # Stage 4: keep randomization very small so stacking remains tractable.
+            target_x = float(self.np_random.uniform(0.23, 0.27))
+            target_y = float(self.np_random.uniform(-0.04, 0.04))
+            self.model.body_pos[self.target_body_id] = np.array([target_x, target_y, table_z])
+
+            red_x = float(self.np_random.uniform(0.13, 0.19))
+            red_y = float(self.np_random.uniform(0.10, 0.18))
+            blue_x = float(self.np_random.uniform(0.13, 0.19))
+            blue_y = float(self.np_random.uniform(-0.18, -0.10))
+
+            qpos[red_qpos_idx : red_qpos_idx + 3] = np.array([red_x, red_y, table_z])
+            qpos[blue_qpos_idx : blue_qpos_idx + 3] = np.array([blue_x, blue_y, table_z])
+            qvel[red_qpos_idx : red_qpos_idx + 3] = 0.0
+            qvel[blue_qpos_idx : blue_qpos_idx + 3] = 0.0
 
         # Set the state with the noisy positions
         self.set_state(qpos, qvel)

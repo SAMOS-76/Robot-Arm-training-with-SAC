@@ -17,7 +17,7 @@
   <default>
     <default class="sts3215">
       <geom contype="0" conaffinity="0"/>
-      <joint damping="0.60" frictionloss="0.052" armature="0.028"/>
+      <joint damping="0.40" frictionloss="0.052" armature="0.028"/>
       <position kp="120" kv="3.5" forcerange="-3.35 3.35"/>
     </default>
     <default class="backlash">
@@ -30,13 +30,13 @@
     
     <body name="block_red" pos="0.15 0.15 0.02">
       <freejoint name="block_red_joint"/>
-      <geom name="block_red_geom" type="box" size="0.02 0.02 0.02" rgba="1 0.1 0.1 1" mass="0.05" condim="4" friction="1.5 0.1 0.1" group="3"/>
+      <geom name="block_red_geom" type="box" size="0.02 0.02 0.02" rgba="1 0.1 0.1 1" mass="0.05" condim="4" friction="0.9 0.05 0.02" group="3"/>
       <site name="block_red_site" pos="0 0 0" size="0.005" type="sphere" rgba="0 0 0 0"/>
     </body>
 
     <body name="block_blue" pos="0.15 -0.15 0.02">
       <freejoint name="block_blue_joint"/>
-      <geom name="block_blue_geom" type="box" size="0.02 0.02 0.02" rgba="0.1 0.1 1 1" mass="0.05" condim="4" friction="1.5 0.1 0.1" group="3"/>
+      <geom name="block_blue_geom" type="box" size="0.02 0.02 0.02" rgba="0.1 0.1 1 1" mass="0.05" condim="4" friction="0.9 0.05 0.02" group="3"/>
       <site name="block_blue_site" pos="0 0 0" size="0.005" type="sphere" rgba="0 0 0 0"/>
     </body>
 
