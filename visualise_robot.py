@@ -1,24 +1,19 @@
-import mujoco
-import mujoco.viewer
-import time
+import gymnasium as gym
+import panda_gym
 
-model = mujoco.MjModel.from_xml_path("SO101/block_stack.xml")
-data = mujoco.MjData(model)
 
-print("Model loaded")
-
-cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "gripper_camera")
-
-with mujoco.viewer.launch_passive(model, data) as viewer:
-    start_time = time.time()
-    while viewer.is_running() and time.time() - start_time < 300:
-        # viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
-        # viewer.cam.fixedcamid = cam_id
-        step_start = time.time()
-        
-        mujoco.mj_step(model, data)
-        viewer.sync()
-        
-        time_until_next_step = model.opt.timestep - (time.time() - step_start)
-        if time_until_next_step > 0:
-            time.sleep(time_until_next_step)
+env = gym.make(
+    "PandaSlide-v3",
+    render_mode="rgb_array",
+    renderer="OpenGL",
+    render_width=480,
+    render_height=480,
+    render_target_position=[0.2, 0, 0],
+    render_distance=1.0,
+    render_yaw=90,
+    render_pitch=-70,
+    render_roll=0,
+)
+env.reset()
+image = env.render()  # RGB rendering of shape (480, 480, 3)
+env.close()
