@@ -97,7 +97,9 @@ class CriticNetworks(nn.Module):
 # SAC class
 class SACAgent():
     def __init__(self, env, device, reward_env, timesteps=1000000, replay_size=1_000_000,
-                 batch_size=512, updates_per_step=2):
+                 batch_size=512, updates_per_step=4, target_entropy=None,
+                 random_explore_steps=1_000, learning_steps=1_000, fixed_alpha=None,
+                 her_ratio=0.8):
         self.env = env
         self.device = device
         self.total_timesteps = timesteps
@@ -108,15 +110,28 @@ class SACAgent():
         self.reward_env = reward_env.unwrapped if hasattr(reward_env, "unwrapped") else reward_env
         self.reward_fn = self.reward_env.compute_reward
 
-        # Hyperparameters (unchanged from SAC_agent_HER.py)
+        # Hyperparameters
         self.critic_learning_rate = 0.0001
         self.actor_learning_rate = 0.0001
-        self.gamma = 0.995
+        # [RETUNE] gamma 0.995 -> 0.95 for panda. Episodes are 50 steps; 1/(1-0.95)=20-step
+        # effective horizon fits the task, whereas 0.995 implies a ~200-step horizon the env
+        # never reaches and inflates Q-targets under the non-terminal (always-bootstrap) target.
+        self.gamma = 0.95
         self.batch_size = int(batch_size)
         self.replay_size = int(replay_size)
+        # [RETUNE] updates_per_step 2 -> 4 (default): raises the gradient-update : env-step ratio
+        # from 0.25 to 0.5 for sample efficiency. A 1:1 ratio (=n_envs) would be better still, but
+        # is gated by the cost of the un-vectorized sample() loop (kept by choice).
         self.updates_per_step = max(1, int(updates_per_step))
-        self.learning_steps = 50_000
-        self.random_explore_steps = 50_000
+        # Fraction of each sampled batch that gets future-relabeled (HER). 0.8 is the standard
+        # value (= SB3's n_sampled_goal=4). Exposed so the goal-distribution trade-off can be tuned.
+        self.her_ratio = float(her_ratio)
+        # [RETUNE] warmup is now task-configurable (was a hardcoded 50_000). For an easy task like
+        # Reach, ~1_000 is plenty (HER makes early data useful). For hard-exploration PickAndPlace a
+        # larger random warmup (~10-25k) helps, since random flailing is how the buffer first
+        # stumbles onto a grasp. learning_steps gates min buffer fill before any gradient update.
+        self.learning_steps = int(learning_steps)              # min buffer transitions before any gradient update
+        self.random_explore_steps = int(random_explore_steps)  # env steps of uniform-random actions before using the actor
 
         # Transition-capped episodic replay (HER-compatible)
         self.replay_buffer = GlobalEpisodicReplayBuffer(max_transitions=self.replay_size)
@@ -141,10 +156,18 @@ class SACAgent():
         self.actor_optim = torch.optim.Adam(self.Actor.parameters(), lr=self.actor_learning_rate)
         self.critic_optim = torch.optim.Adam(self.Critic.parameters(), lr=self.critic_learning_rate)
 
-        self.log_alpha = torch.tensor(np.log(0.1), requires_grad=True, device=self.device)
+        # [RETUNE] optional fixed alpha. target_entropy=-2 alone did NOT stop alpha collapsing to
+        # ~0.005 on PickAndPlace (exploration died and Succ(100) regressed from ~0.33), so allow
+        # pinning a constant entropy temperature. fixed_alpha=None keeps the standard auto-tuned alpha.
+        self.auto_alpha = fixed_alpha is None
+        init_alpha = 0.1 if self.auto_alpha else float(fixed_alpha)
+        self.log_alpha = torch.tensor(np.log(init_alpha), requires_grad=self.auto_alpha, device=self.device)
         self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=0.0003)
-        # [PANDA] act_dim 6 -> 4 (env-forced), so target_entropy moves -6 -> -4.
-        self.target_entropy = -act_dim
+        # [RETUNE] SAC default target entropy is -act_dim (=-4 for panda's 4-D action). For a hard
+        # exploration task (PickAndPlace) a less-negative target (e.g. -2) keeps the policy stochastic
+        # longer so it can still discover a grasp, instead of alpha collapsing to ~0 and the policy
+        # going deterministic before it ever succeeds. Configurable; None -> -act_dim.
+        self.target_entropy = float(target_entropy) if target_entropy is not None else -act_dim
 
         self.log_every_episodes = 10
 
@@ -216,16 +239,22 @@ class SACAgent():
         actor_loss.backward()
         self.actor_optim.step()
 
-        # Update alpha during Actor loop
-        # Below was very unstable changed to alpha trick
-        # alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+        # Update alpha during Actor loop (skipped when a fixed alpha is pinned).
+        if self.auto_alpha:
+            # Below was very unstable changed to alpha trick
+            # alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            self.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optim.step()
+            alpha_loss_value = alpha_loss.item()
+        else:
+            alpha_loss_value = 0.0
 
-        self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
-
-        return actor_loss.item(), alpha_loss.item()
+        # [DIAG] policy entropy proxy = mean(-log pi). If this falls toward/below target_entropy
+        # while the task fails, the actor has collapsed onto an arbitrary deterministic action.
+        policy_entropy = (-log_prob).mean().item()
+        return actor_loss.item(), alpha_loss_value, policy_entropy
 
     # [PANDA] HER relabel: SAME strategy as SAC_agent_HER.sample() (80% future
     # relabel, episode sampled weighted by length, future-only goal), but the goal
@@ -241,7 +270,7 @@ class SACAgent():
         lengths = np.asarray(self.replay_buffer.episode_lengths, dtype=np.float64)
         probs = lengths / lengths.sum()
         episode_indices = np.random.choice(len(episodes), size=self.batch_size, replace=True, p=probs)  # Weighted sampling to prioritise sampling from longer eps
-        HER_masking = np.random.rand(self.batch_size) < 0.8
+        HER_masking = np.random.rand(self.batch_size) < self.her_ratio
 
         obs_inputs = np.empty((self.batch_size, self.fused_obs_dim), dtype=np.float32)
         next_obs_inputs = np.empty((self.batch_size, self.fused_obs_dim), dtype=np.float32)
@@ -337,6 +366,19 @@ class SACAgent():
 
         start_time = time.time()
         n_envs = self.env.num_envs
+
+        # One-time run header (keeps the per-episode log free of static config noise).
+        alpha_mode = f"auto(target_entropy={self.target_entropy})" if self.auto_alpha else f"fixed({self.log_alpha.exp().item():.3f})"
+        print(
+            f"{'='*75}\n"
+            f"SAC+HER on panda-gym | device={self.device} | n_envs={n_envs}\n"
+            f"    gamma={self.gamma} | batch={self.batch_size} | updates/step={self.updates_per_step} "
+            f"| her_ratio={self.her_ratio} | alpha={alpha_mode} | warmup={self.random_explore_steps} env-steps\n"
+            f"    budget={self.total_timesteps} global steps = {self.total_timesteps * n_envs} env-steps\n"
+            f"{'='*75}",
+            flush=True,
+        )
+
         episode_rewards = np.zeros(n_envs)
         episode_returns = []
         episode_count = 0
@@ -352,6 +394,10 @@ class SACAgent():
         critic_loss_history = deque(maxlen=100)
         actor_loss_history = deque(maxlen=100)
         alpha_loss_history = deque(maxlen=100)
+        # [DIAG] entropy + fraction of each sampled batch with reward==0 (HER/real successes
+        # actually reaching the critic). If r0_frac is ~0, the problem is reward plumbing, not alpha.
+        entropy_history = deque(maxlen=100)
+        r0_frac_history = deque(maxlen=100)
 
         # Replay buffer (per-env in-progress episodes; flushed on done)
         local_replay_buffer = [[] for _ in range(n_envs)]
@@ -382,21 +428,14 @@ class SACAgent():
 
                 # [PANDA] === TEMP BOUNDARY DEBUG (remove) ===
                 if debug_boundary and global_step == start_timestep:
-                    print("=" * 30 + " TEMP BOUNDARY DEBUG (remove) " + "=" * 30)
-                    print("obs dict keys:", list(raw_next_obs.keys()))
-                    for _k, _v in raw_next_obs.items():
-                        _a = np.asarray(_v)
-                        print(f"  obs['{_k}']: shape={_a.shape} dtype={_a.dtype}")
-                    print("action batch shape:", np.asarray(actions_np).shape, "dtype:", np.asarray(actions_np).dtype)
-                    print("reward shape:", np.asarray(reward).shape, "dtype:", np.asarray(reward).dtype)
-                    print("info keys:", list(infos.keys()))
-                    print("fused_obs_dim:", self.fused_obs_dim, "(= observation", self.observation_dim, "+ goal", self.goal_dim, ")")
-                    print("act_dim:", self.act_dim, "target_entropy:", self.target_entropy)
-                    _ag = np.asarray(raw_next_obs["achieved_goal"])
-                    _dg = np.asarray(raw_next_obs["desired_goal"])
-                    print("compute_reward(ag, dg) sample[:3]:", np.asarray(self.reward_fn(_ag, _dg, [{} for _ in range(len(_ag))]))[:3])
-                    print("compute_reward(ag, ag) sample[:3] (expect ~0):", np.asarray(self.reward_fn(_ag, _ag, [{} for _ in range(len(_ag))]))[:3])
-                    print("=" * 90)
+                    _shapes = {k: (np.asarray(v).shape, np.asarray(v).dtype) for k, v in raw_next_obs.items()}
+                    _ag, _dg = np.asarray(raw_next_obs["achieved_goal"]), np.asarray(raw_next_obs["desired_goal"])
+                    _info = [{} for _ in range(len(_ag))]
+                    print("--- TEMP BOUNDARY DEBUG (remove) ---")
+                    print(f"  obs {_shapes} | action {np.asarray(actions_np).shape} | reward {np.asarray(reward).shape} | info {list(infos.keys())}")
+                    print(f"  fused_obs_dim={self.fused_obs_dim} (obs {self.observation_dim}+goal {self.goal_dim}) | act_dim={self.act_dim} | target_entropy={self.target_entropy}")
+                    print(f"  compute_reward(ag,dg)[:3]={np.asarray(self.reward_fn(_ag, _dg, _info))[:3]} | (ag,ag)[:3]={np.asarray(self.reward_fn(_ag, _ag, _info))[:3]} (expect ~0)")
+                    print("------------------------------------")
                 # [PANDA] === END TEMP BOUNDARY DEBUG ===
 
                 dones = np.logical_or(terminated, truncated)
@@ -457,13 +496,18 @@ class SACAgent():
                         c_loss_avg = float(np.mean(critic_loss_history)) if len(critic_loss_history) > 0 else float("nan")
                         a_loss_avg = float(np.mean(actor_loss_history)) if len(actor_loss_history) > 0 else float("nan")
                         alpha_val = float(self.log_alpha.exp().item())
+                        # [DIAG] entropy vs target_entropy, and batch success(reward==0) fraction.
+                        ent_avg = float(np.mean(entropy_history)) if len(entropy_history) > 0 else float("nan")
+                        r0_avg = float(np.mean(r0_frac_history)) if len(r0_frac_history) > 0 else float("nan")
 
-                        if (episode_count % self.log_every_episodes == 0) or (success_i > 0.5):
+                        # Throttle to every Nth episode. (Dropped the per-success trigger, which
+                        # floods the console once the policy starts succeeding across n_envs.)
+                        if episode_count % self.log_every_episodes == 0:
                             print(
                                 f"[{formatted_time}] Step: {total_env_steps} | SPS: {sps} | Ep: {episode_count}\n"
                                 f"    ├─ Returns: Current={ret:.2f} | Avg(10)={ret10:.2f} | Succ(100)={succ100:.2f}\n"
-                                f"    └─ Network: C_Loss={c_loss_avg:.3f} | A_Loss={a_loss_avg:.3f} | Alpha={alpha_val:.4f}\n"
-                                f"    └─ Device: {self.device}\n"
+                                f"    ├─ Network: C_Loss={c_loss_avg:.3f} | A_Loss={a_loss_avg:.3f} | Alpha={alpha_val:.4f}\n"
+                                f"    └─ Diag   : Entropy={ent_avg:.2f} (target {self.target_entropy}) | Batch_r0_frac={r0_avg:.3f}\n"
                                 f"{'-'*75}"
                             )
 
@@ -487,18 +531,21 @@ class SACAgent():
                         critic_loss = self.update_critic(tensor_next_obs, tensor_obs, tensor_actions, tensor_reward, tensor_dones)
 
                         # Train Actor: need to compare to newly updated critic
-                        actor_loss, alpha_loss = self.update_actor(tensor_obs.detach())
+                        actor_loss, alpha_loss, policy_entropy = self.update_actor(tensor_obs.detach())
 
                         critic_loss_history.append(critic_loss)
                         actor_loss_history.append(actor_loss)
                         alpha_loss_history.append(alpha_loss)
+                        # [DIAG] rewards_ are 0.0 (success) or -1.0; fraction == 0 = signal reaching critic.
+                        entropy_history.append(policy_entropy)
+                        r0_frac_history.append(float(np.mean(rewards_ > -0.5)))
 
                         # Soft update the TargetCritic
                         for target_param, local_param in zip(self.TargetCritic.parameters(), self.Critic.parameters()):
                             target_param.data.copy_(tau * local_param.data + (1.0 - tau) * target_param.data)
 
                 raw_obs = raw_next_obs
-                fused_obs = fused_next_obs = self.fuse_observations(raw_next_obs)
+                fused_obs = self.fuse_observations(raw_next_obs)
 
                 # Save model after certain amount of timesteps
                 if global_step % save_timesteps == 0:

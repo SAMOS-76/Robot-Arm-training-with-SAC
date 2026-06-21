@@ -24,8 +24,6 @@ import torch
 
 from SAC_agent_HER_panda import ActorNetwork
 
-ENV_ID = "PandaPickAndPlace-v3"
-
 
 def policy_action(actor, obs, device, deterministic=True):
     # [PANDA] policy input = concat(observation, desired_goal); achieved_goal excluded.
@@ -61,7 +59,9 @@ def save_gif(frames, path, fps=25):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models-dir", type=str, default="models/SAC_panda")
+    parser.add_argument("--env", type=str, default="PandaPickAndPlace-v3",
+                        help="panda-gym goal env id (match the one used for training)")
+    parser.add_argument("--models-dir", type=str, default=None, help="Checkpoint dir (default: models/SAC_<env>)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint filename or numeric step in Actor/. Default: latest")
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--stochastic", action="store_true")
@@ -69,8 +69,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    models_dir = args.models_dir or f"models/SAC_{args.env}"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    actor_dir = Path(args.models_dir) / "Actor"
+    actor_dir = Path(models_dir) / "Actor"
 
     # Resolve checkpoint (latest numeric if unspecified).
     if args.checkpoint and (actor_dir / args.checkpoint).is_file():
@@ -89,7 +90,7 @@ def main():
         else:
             ckpt = max(cands, key=lambda x: x[0])[1]
 
-    env = gym.make(ENV_ID, render_mode="rgb_array")
+    env = gym.make(args.env, render_mode="rgb_array")
     obs_dim = env.observation_space["observation"].shape[0] + env.observation_space["desired_goal"].shape[0]
     act_dim = env.action_space.shape[0]
     actor = ActorNetwork(obs_dim=obs_dim, act_dim=act_dim).to(device)
