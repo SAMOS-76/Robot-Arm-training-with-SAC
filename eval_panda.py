@@ -22,12 +22,14 @@ import numpy as np
 import panda_gym  # noqa: F401
 import torch
 
-from SAC_agent_HER_panda import ActorNetwork
+from SAC_agent_HER_panda import ActorNetwork, RunningMeanStd
 
 
-def policy_action(actor, obs, device, deterministic=True):
+def policy_action(actor, obs, device, normalizer=None, deterministic=True):
     # [PANDA] policy input = concat(observation, desired_goal); achieved_goal excluded.
     obs_input = np.concatenate([obs["observation"], obs["desired_goal"]]).astype(np.float32)
+    if normalizer is not None:
+        obs_input = normalizer.normalize(obs_input[None, :])[0]
     obs_tensor = torch.as_tensor(obs_input, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
         mean, log_sd = actor(obs_tensor)
@@ -98,6 +100,16 @@ def main():
     actor.eval()
     print(f"[eval] loaded {ckpt} | obs_dim={obs_dim} act_dim={act_dim} | device={device}")
 
+    # Load the matching observation-normalizer stats (training normalized the network input).
+    normalizer = None
+    norm_path = Path(models_dir) / "Normalizer" / ckpt.name
+    if norm_path.is_file():
+        normalizer = RunningMeanStd(obs_dim)
+        normalizer.load_state_dict(torch.load(norm_path, map_location="cpu", weights_only=False))
+        print(f"[eval] loaded normalizer stats: {norm_path}")
+    else:
+        print(f"[eval] WARNING: no normalizer at {norm_path} — feeding UNNORMALIZED obs (policy may look broken)")
+
     frames = []
     successes = []
     for ep in range(args.episodes):
@@ -106,7 +118,7 @@ def main():
         ep_success = False
         while not done:
             frames.append(np.asarray(env.render()))
-            action = policy_action(actor, obs, device, deterministic=not args.stochastic)
+            action = policy_action(actor, obs, device, normalizer=normalizer, deterministic=not args.stochastic)
             obs, reward, terminated, truncated, info = env.step(action)
             ep_success = ep_success or bool(info.get("is_success", False))
             done = bool(terminated or truncated)

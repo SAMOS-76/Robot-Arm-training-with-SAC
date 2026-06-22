@@ -53,13 +53,14 @@ def main():
     parser.add_argument("--num-envs", type=int, default=8, help="Number of parallel environments")
     parser.add_argument("--replay-size", type=int, default=1_000_000, help="Replay capacity in transitions")
     parser.add_argument("--batch-size", type=int, default=512, help="Mini-batch size")
-    parser.add_argument("--updates-per-step", type=int, default=4, help="Gradient updates per global step")
+    parser.add_argument("--updates-per-step", type=int, default=8, help="Gradient updates per global step (8 = ~1:1 with 8 envs; affordable now the sampler is vectorized)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Actor/critic learning rate (SAC default 3e-4; was 1e-4)")
     # [RETUNE] exploration knobs (see SAC_agent_HER_panda.py). Defaults target the HARD task
     # (PickAndPlace): a bigger random warmup to discover grasps, and a less-negative target entropy
     # so alpha doesn't collapse to ~0 and kill exploration before the policy ever succeeds.
     parser.add_argument("--warmup", type=int, default=15_000, help="Env-steps of uniform-random actions before using the actor")
-    parser.add_argument("--target-entropy", type=float, default=-2.0, help="SAC target entropy for auto-alpha (-act_dim is -4 for panda; less-negative = more exploration)")
-    parser.add_argument("--fixed-alpha", type=float, default=None, help="Pin a constant entropy temperature (disables auto-alpha). Try ~0.05 if auto-alpha keeps collapsing to ~0")
+    parser.add_argument("--target-entropy", type=float, default=None, help="SAC target entropy for auto-alpha (default None -> -act_dim = -4 for panda; less-negative = more exploration)")
+    parser.add_argument("--fixed-alpha", type=float, default=None, help="Pin a constant entropy temperature (disables auto-alpha). Fallback if auto-alpha collapses to ~0")
     parser.add_argument("--her-ratio", type=float, default=0.8, help="Fraction of each batch that is HER future-relabeled (0.8 = standard; lower = more real-goal transitions)")
     parser.add_argument("--models-dir", type=str, default=None, help="Checkpoint dir (default: models/SAC_<env>)")
     parser.add_argument("--debug-boundary", action="store_true", help="Print one-shot env-boundary shape/dtype debug on the first step")
@@ -97,6 +98,7 @@ def main():
         random_explore_steps=args.warmup,
         fixed_alpha=args.fixed_alpha,
         her_ratio=args.her_ratio,
+        lr=args.lr,
     )
 
     start_timestep = 0
