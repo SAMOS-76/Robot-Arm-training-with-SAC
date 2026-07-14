@@ -33,7 +33,7 @@ from torch import nn
 from torch.distributions import Normal
 from collections import deque, namedtuple
 
-# [PANDA] goal fields stored separately instead of being sliced out of a 39-vector.
+# Data struct for timestep info
 StepInfo = namedtuple(
     "StepInfo",
     ["observation", "action", "reward", "next_observation", "next_achieved_goal", "desired_goal", "done"],
@@ -41,11 +41,8 @@ StepInfo = namedtuple(
 
 
 class RunningMeanStd:
-    """Per-dimension running mean/variance (parallel/Chan update, same as SB3 VecNormalize).
-
-    Used to normalize the policy/critic INPUT only. Raw achieved/desired goals are kept elsewhere
-    for HER relabeling + compute_reward, so this never changes the reward or the relabel logic.
-    """
+    # Normalise the observations so they are around the same range
+    # Ensures some observations don't dominate over small observations
 
     def __init__(self, dim, eps=1e-4):
         self.mean = np.zeros(dim, dtype=np.float64)
@@ -60,15 +57,15 @@ class RunningMeanStd:
         batch_var = x.var(axis=0)
         batch_count = x.shape[0]
         delta = batch_mean - self.mean
-        tot = self.count + batch_count
-        self.mean = self.mean + delta * batch_count / tot
+        total = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / total
         m_a = self.var * self.count
         m_b = batch_var * batch_count
-        M2 = m_a + m_b + (delta ** 2) * self.count * batch_count / tot
-        self.var = M2 / tot
-        self.count = tot
+        M2 = m_a + m_b + (delta ** 2) * self.count * batch_count / total
+        self.var = M2 / total
+        self.count = total
 
-    def normalize(self, x):
+    def normalise(self, x):
         return np.clip((x - self.mean) / np.sqrt(self.var + 1e-8), -5.0, 5.0).astype(np.float32)
 
     def state_dict(self):
@@ -80,7 +77,6 @@ class RunningMeanStd:
         self.count = float(state["count"])
 
 
-# ----- SAC networks (copied verbatim from SAC_agent_HER.py) -----------------
 class ActorNetwork(nn.Module):
     def __init__(self, obs_dim, act_dim, hidden=256):
         super().__init__()
@@ -136,46 +132,28 @@ class CriticNetworks(nn.Module):
 
 # SAC class
 class SACAgent():
-    def __init__(self, env, device, reward_env, timesteps=1000000, replay_size=1_000_000,
-                 batch_size=512, updates_per_step=8, target_entropy=None,
-                 random_explore_steps=1_000, learning_steps=1_000, fixed_alpha=None,
-                 her_ratio=0.8, lr=3e-4, normalize_obs=True):
+    def __init__(self, env, device, reward_env, timesteps=1000000, replay_size=1_000_000, batch_size=512, updates_per_step=8,
+                 random_explore_steps=1_000, learning_steps=1_000, her_ratio=0.8, lr=3e-4, normalise_obs=True):
         self.env = env
         self.device = device
         self.total_timesteps = timesteps
 
-        # [PANDA] dedicated un-vectorized reference env supplying the sparse reward
-        # for HER relabels. We never reimplement the reward; we call its
-        # compute_reward on the whole minibatch at once (vectorized numpy).
+        # Get same reward environment and function from the PandaGym environment
+        # Easier to do like this then rather trying to copy my custom reward as this is already layed out for me
         self.reward_env = reward_env.unwrapped if hasattr(reward_env, "unwrapped") else reward_env
         self.reward_fn = self.reward_env.compute_reward
-
-        # Hyperparameters
-        # [RETUNE] lr 1e-4 -> 3e-4 (SAC default). Our 1e-4 was conservative and a likely cause of
-        # slow learning on the object-goal tasks (Reach solved fine; Push/PickAndPlace crawled).
         self.critic_learning_rate = float(lr)
         self.actor_learning_rate = float(lr)
-        # [RETUNE] gamma 0.995 -> 0.95 for panda. Episodes are 50 steps; 1/(1-0.95)=20-step
-        # effective horizon fits the task, whereas 0.995 implies a ~200-step horizon the env
-        # never reaches and inflates Q-targets under the non-terminal (always-bootstrap) target.
+        # Retuned gamma from 0.995 to 0.95 as found that it was prioritising later rewards too much
         self.gamma = 0.95
         self.batch_size = int(batch_size)
         self.replay_size = int(replay_size)
-        # [RETUNE] updates_per_step 2 -> 4 (default): raises the gradient-update : env-step ratio
-        # from 0.25 to 0.5 for sample efficiency. A 1:1 ratio (=n_envs) would be better still, but
-        # is gated by the cost of the un-vectorized sample() loop (kept by choice).
-        self.updates_per_step = max(1, int(updates_per_step))
-        # Fraction of each sampled batch that gets future-relabeled (HER). 0.8 is the standard
-        # value (= SB3's n_sampled_goal=4). Exposed so the goal-distribution trade-off can be tuned.
+        self.updates_per_step = int(updates_per_step) # What is updates_per_step doin again
         self.her_ratio = float(her_ratio)
-        # [RETUNE] warmup is now task-configurable (was a hardcoded 50_000). For an easy task like
-        # Reach, ~1_000 is plenty (HER makes early data useful). For hard-exploration PickAndPlace a
-        # larger random warmup (~10-25k) helps, since random flailing is how the buffer first
-        # stumbles onto a grasp. learning_steps gates min buffer fill before any gradient update.
         self.learning_steps = int(learning_steps)              # min buffer transitions before any gradient update
         self.random_explore_steps = int(random_explore_steps)  # env steps of uniform-random actions before using the actor
 
-        # [PANDA] policy input = concat(observation, desired_goal); achieved_goal excluded.
+        # Note for panda achieved goal is a part of observation when getting the observation space
         obs_space = env.single_observation_space
         self.observation_dim = obs_space["observation"].shape[0]
         self.goal_dim = obs_space["desired_goal"].shape[0]
@@ -183,24 +161,19 @@ class SACAgent():
         act_dim = env.single_action_space.shape[0]
         self.act_dim = act_dim
 
-        # Vectorized transition-capped episodic replay (HER-compatible)
-        self.replay_buffer = GlobalEpisodicReplayBuffer(
-            max_transitions=self.replay_size,
-            obs_dim=self.observation_dim,
-            act_dim=self.act_dim,
-            goal_dim=self.goal_dim,
-        )
+        self.replay_buffer = GlobalEpisodicReplayBuffer(max_transitions=self.replay_size, obs_dim=self.observation_dim, act_dim=self.act_dim, goal_dim=self.goal_dim)
 
-        # Observation normalization over the network input concat(observation, desired_goal).
+        # Observation normalisation over the network input concat(observation, desired_goal).
         # Raw achieved/desired goals are kept for HER relabel + compute_reward (real units).
-        self.normalize_obs = bool(normalize_obs)
-        self.obs_normalizer = RunningMeanStd(self.fused_obs_dim)
+        # Normalisation only for network input
+        self.normalise_obs = bool(normalise_obs)
+        self.obs_normaliser = RunningMeanStd(self.fused_obs_dim)
 
         # Network Initialisation
         self.Critic = CriticNetworks(self.fused_obs_dim, act_dim).to(self.device)
         self.Actor = ActorNetwork(self.fused_obs_dim, act_dim).to(self.device)
         self.TargetCritic = CriticNetworks(self.fused_obs_dim, act_dim).to(self.device)
-
+        # Make target network weights the same as critic
         self.TargetCritic.load_state_dict(self.Critic.state_dict())
         for parameter in self.TargetCritic.parameters():
             parameter.requires_grad = False
@@ -208,34 +181,24 @@ class SACAgent():
         self.actor_optim = torch.optim.Adam(self.Actor.parameters(), lr=self.actor_learning_rate)
         self.critic_optim = torch.optim.Adam(self.Critic.parameters(), lr=self.critic_learning_rate)
 
-        # [RETUNE] optional fixed alpha. target_entropy=-2 alone did NOT stop alpha collapsing to
-        # ~0.005 on PickAndPlace (exploration died and Succ(100) regressed from ~0.33), so allow
-        # pinning a constant entropy temperature. fixed_alpha=None keeps the standard auto-tuned alpha.
-        self.auto_alpha = fixed_alpha is None
-        init_alpha = 0.1 if self.auto_alpha else float(fixed_alpha)
-        self.log_alpha = torch.tensor(np.log(init_alpha), requires_grad=self.auto_alpha, device=self.device)
+        self.log_alpha = torch.tensor(np.log(0.1), requires_grad=True, device=self.device)
         self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=0.0003)
-        # [RETUNE] SAC default target entropy is -act_dim (=-4 for panda's 4-D action). For a hard
-        # exploration task (PickAndPlace) a less-negative target (e.g. -2) keeps the policy stochastic
-        # longer so it can still discover a grasp, instead of alpha collapsing to ~0 and the policy
-        # going deterministic before it ever succeeds. Configurable; None -> -act_dim.
-        self.target_entropy = float(target_entropy) if target_entropy is not None else -act_dim
+        self.target_entropy = -act_dim
 
         self.log_every_episodes = 10
 
-    # [PANDA] policy/critic input builder: concat(observation, desired_goal), then normalize.
+    # fuse observations and normalise into format for networks
     def fuse_observations(self, obs):
         observation = np.asarray(obs["observation"], dtype=np.float32)
         desired_goal = np.asarray(obs["desired_goal"], dtype=np.float32)
-        if observation.ndim == 1:
+        if observation.ndim == 1: # Add dimentionality if only 1 env is being used like in eval
             observation = observation[None, :]
             desired_goal = desired_goal[None, :]
         fused = np.concatenate([observation, desired_goal], axis=1)
-        if self.normalize_obs:
-            fused = self.obs_normalizer.normalize(fused)
+        if self.normalise_obs:
+            fused = self.obs_normaliser.normalise(fused)
         return torch.as_tensor(fused, dtype=torch.float32, device=self.device)
 
-    # ----- SAC updates (copied verbatim from SAC_agent_HER.py) ---------------
     def update_critic(self, next_obs, obs, action, reward, done):
         with torch.no_grad():
             # Get "future" action by passing in next_obs from replay buffer
@@ -294,71 +257,61 @@ class SACAgent():
         actor_loss.backward()
         self.actor_optim.step()
 
-        # Update alpha during Actor loop (skipped when a fixed alpha is pinned).
-        if self.auto_alpha:
-            # Below was very unstable changed to alpha trick
-            # alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
-            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
-            alpha_loss_value = alpha_loss.item()
-        else:
-            alpha_loss_value = 0.0
+        # Below was very unstable changed to alpha trick
+        # alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
+        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+        self.alpha_optim.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optim.step()
+        alpha_loss_value = alpha_loss.item()
 
-        # [DIAG] policy entropy proxy = mean(-log pi). If this falls toward/below target_entropy
-        # while the task fails, the actor has collapsed onto an arbitrary deterministic action.
         policy_entropy = (-log_prob).mean().item()
         return actor_loss.item(), alpha_loss_value, policy_entropy
 
-    # [PANDA] HER relabel: SAME strategy as SAC_agent_HER.sample() (80% future
-    # relabel, episode sampled weighted by length, future-only goal), but the goal
-    # is read from dict-key fields instead of array slices, the relabeled reward
-    # comes from the reference env's compute_reward (batched), and done stays 0.
     def sample(self):
-        # Fully vectorized HER sampling. SAME strategy as before (future relabel at `her_ratio`,
-        # uniform-over-transitions == episode-length-weighted, done==0), but with numpy fancy
-        # indexing over the flat buffer arrays -- no Python per-sample loop, no list(buffer) rebuild.
         buf = self.replay_buffer
         if buf.size < self.batch_size:
             return None
 
-        vi = buf.valid_indices
-        idx = vi[np.random.randint(0, vi.shape[0], size=self.batch_size)]
-        ep_end_i = buf.ep_end[idx]
+        # With the nature of the buffer used, some spaces are invalide so have to keep track when sampling
+        sampled_indices = buf.valid_indices[np.random.randint(0, buf.valid_indices.shape[0], size=self.batch_size)]
+        episode_end = buf.ep_end[sampled_indices] # Get the index of the episode end for each sampled transition
+        her_mask = (np.random.rand(self.batch_size) < self.her_ratio) & (sampled_indices < episode_end - 1)
 
-        # Relabel only where a strictly-future step exists within the same episode.
-        her = (np.random.rand(self.batch_size) < self.her_ratio) & (idx < ep_end_i - 1)
-        span = np.maximum(ep_end_i - idx - 1, 1)                       # >=1 where `her`
-        future = idx + 1 + (np.random.rand(self.batch_size) * span).astype(np.int64)
-        future = np.minimum(future, ep_end_i - 1)                     # stay within episode
-        future = np.where(her, future, idx)                          # non-relabel: gather self (valid, unused)
-        new_goal = buf.next_achieved_goal[future]                    # future achieved goal
+        # For each HER transition, pick a random future step within the same episode.
+        steps_remaining = np.maximum(episode_end - sampled_indices - 1, 1)
+        future_indices = sampled_indices + 1 + (np.random.rand(self.batch_size) * steps_remaining).astype(np.int64)
+        future_indices = np.minimum(future_indices, episode_end - 1)           
+        future_indices = np.where(her_mask, future_indices, sampled_indices)   # non-HER: point to self (value unused)
 
-        goals = buf.desired_goal[idx].copy()
-        goals[her] = new_goal[her]
+        # Get achieved goal from next time step and relabel desired goal to that if HER index
+        future_achieved_goal = buf.next_achieved_goal[future_indices]
+        goals = buf.desired_goal[sampled_indices].copy()
+        goals[her_mask] = future_achieved_goal[her_mask]
 
-        rewards = buf.reward[idx].astype(np.float32, copy=True)       # stored reward for non-relabel
-        if her.any():
-            k = int(her.sum())
-            relabel_r = np.asarray(
-                self.reward_fn(buf.next_achieved_goal[idx][her], new_goal[her], [{} for _ in range(k)]),
-                dtype=np.float32,
-            ).reshape(-1)
-            rewards[her] = relabel_r
+        # Start with stored rewards (correct for non-HER transitions).
+        # For HER transitions recompute: "did this step's outcome satisfy the pretend goal?"
+        rewards = buf.reward[sampled_indices].astype(np.float32, copy=True)
+        if her_mask.any():
+            n_her = int(her_mask.sum())
+            her_rewards = np.asarray(self.reward_fn(buf.next_achieved_goal[sampled_indices][her_mask], future_achieved_goal[her_mask], [{} for _ in range(n_her)]), dtype=np.float32).reshape(-1)
+            rewards[her_mask] = her_rewards
 
-        dones = np.zeros(self.batch_size, dtype=np.float32)          # [PANDA] fully non-terminal
-        obs_inputs = np.concatenate([buf.obs[idx], goals], axis=1)
-        next_obs_inputs = np.concatenate([buf.next_obs[idx], goals], axis=1)
-        actions = buf.action[idx].astype(np.float32, copy=True)
+        # Panda episodes always end by truncation, never a true terminal state, so done is always 0.
+        dones = np.zeros(self.batch_size, dtype=np.float32)
+
+        # Build the final network inputs: concat(observation, goal) — same layout as fuse_observations().
+        obs_inputs = np.concatenate([buf.obs[sampled_indices], goals], axis=1)
+        next_obs_inputs = np.concatenate([buf.next_obs[sampled_indices], goals], axis=1)
+        actions = buf.action[sampled_indices].astype(np.float32, copy=True)
+
         return obs_inputs, actions, rewards, next_obs_inputs, dones
 
-    # Modified existing load checkpoint code (encoder path removed for panda)
     def load_checkpoint(self, model_path, timestep, load_critic=True):
         actor_path = os.path.join(model_path, "Actor", str(timestep))
         critic_path = os.path.join(model_path, "Critic", str(timestep))
         alpha_path = os.path.join(model_path, "Alpha", str(timestep))
-        norm_path = os.path.join(model_path, "Normalizer", str(timestep))
+        norm_path = os.path.join(model_path, "normaliser", str(timestep))
 
         if not os.path.isfile(actor_path):
             raise FileNotFoundError(f"Actor checkpoint not found: {actor_path}")
@@ -380,8 +333,8 @@ class SACAgent():
             if "alpha_optim" in alpha_state:
                 self.alpha_optim.load_state_dict(alpha_state["alpha_optim"])
 
-        if self.normalize_obs and os.path.isfile(norm_path):
-            self.obs_normalizer.load_state_dict(torch.load(norm_path, map_location="cpu", weights_only=False))
+        if self.normalise_obs and os.path.isfile(norm_path):
+            self.obs_normaliser.load_state_dict(torch.load(norm_path, map_location="cpu", weights_only=False))
 
         print(f"Loaded checkpoint at timestep {timestep}")
 
@@ -389,7 +342,7 @@ class SACAgent():
         actor_dir = os.path.join(model_path, "Actor")
         critic_dir = os.path.join(model_path, "Critic")
         alpha_dir = os.path.join(model_path, "Alpha")
-        norm_dir = os.path.join(model_path, "Normalizer")
+        norm_dir = os.path.join(model_path, "normaliser")
         os.makedirs(alpha_dir, exist_ok=True)
         os.makedirs(actor_dir, exist_ok=True)
         os.makedirs(critic_dir, exist_ok=True)
@@ -398,13 +351,12 @@ class SACAgent():
         start_time = time.time()
         n_envs = self.env.num_envs
 
-        # One-time run header (keeps the per-episode log free of static config noise).
-        alpha_mode = f"auto(target_entropy={self.target_entropy})" if self.auto_alpha else f"fixed({self.log_alpha.exp().item():.3f})"
+        alpha_mode = f"auto(target_entropy={self.target_entropy})"
         print(
             f"{'='*75}\n"
             f"SAC+HER on panda-gym | device={self.device} | n_envs={n_envs}\n"
             f"    gamma={self.gamma} | lr={self.actor_learning_rate} | batch={self.batch_size} "
-            f"| updates/step={self.updates_per_step} | obs_norm={self.normalize_obs}\n"
+            f"| updates/step={self.updates_per_step} | obs_norm={self.normalise_obs}\n"
             f"    her_ratio={self.her_ratio} | alpha={alpha_mode} | warmup={self.random_explore_steps} env-steps\n"
             f"    budget={self.total_timesteps} global steps = {self.total_timesteps * n_envs} env-steps\n"
             f"{'='*75}",
@@ -416,9 +368,8 @@ class SACAgent():
         episode_count = 0
         tau = 0.005
 
-        # [PANDA] NEXT_STEP autoreset bookkeeping: when an env is done at step t,
-        # the NEXT step is a throwaway reset step (action ignored, reward is a
-        # placeholder). We must not store that transition.
+        # If an env finishes the timestep after it finishes is an inbetween step which shouldn't be sotred
+        # Need to keep track of which envs have/not been resetto not add the reset timestep to the buffer
         autoreset_pending = np.zeros(n_envs, dtype=bool)
 
         # Episode data logging
@@ -426,12 +377,10 @@ class SACAgent():
         critic_loss_history = deque(maxlen=100)
         actor_loss_history = deque(maxlen=100)
         alpha_loss_history = deque(maxlen=100)
-        # [DIAG] entropy + fraction of each sampled batch with reward==0 (HER/real successes
-        # actually reaching the critic). If r0_frac is ~0, the problem is reward plumbing, not alpha.
         entropy_history = deque(maxlen=100)
         r0_frac_history = deque(maxlen=100)
 
-        # Replay buffer (per-env in-progress episodes; flushed on done)
+        # local replay buffer per env to keep track
         local_replay_buffer = [[] for _ in range(n_envs)]
 
         raw_obs, _ = self.env.reset()
@@ -442,7 +391,7 @@ class SACAgent():
             for global_step in range(start_timestep, start_timestep + self.total_timesteps):
                 total_env_steps = global_step * n_envs
 
-                # Random warmup to seed the replay buffer with diverse trajectories.
+                # Random warmup
                 if total_env_steps < self.random_explore_steps:
                     low = self.env.single_action_space.low
                     high = self.env.single_action_space.high
@@ -458,25 +407,13 @@ class SACAgent():
 
                 raw_next_obs, reward, terminated, truncated, infos = self.env.step(actions_np)
 
-                # [PANDA] === TEMP BOUNDARY DEBUG (remove) ===
-                if debug_boundary and global_step == start_timestep:
-                    _shapes = {k: (np.asarray(v).shape, np.asarray(v).dtype) for k, v in raw_next_obs.items()}
-                    _ag, _dg = np.asarray(raw_next_obs["achieved_goal"]), np.asarray(raw_next_obs["desired_goal"])
-                    _info = [{} for _ in range(len(_ag))]
-                    print("--- TEMP BOUNDARY DEBUG (remove) ---")
-                    print(f"  obs {_shapes} | action {np.asarray(actions_np).shape} | reward {np.asarray(reward).shape} | info {list(infos.keys())}")
-                    print(f"  fused_obs_dim={self.fused_obs_dim} (obs {self.observation_dim}+goal {self.goal_dim}) | act_dim={self.act_dim} | target_entropy={self.target_entropy}")
-                    print(f"  compute_reward(ag,dg)[:3]={np.asarray(self.reward_fn(_ag, _dg, _info))[:3]} | (ag,ag)[:3]={np.asarray(self.reward_fn(_ag, _ag, _info))[:3]} (expect ~0)")
-                    print("------------------------------------")
-                # [PANDA] === END TEMP BOUNDARY DEBUG ===
-
                 dones = np.logical_or(terminated, truncated)
                 is_autoreset = autoreset_pending.copy()      # envs being reset THIS step
                 autoreset_pending[:] = False
 
-                # Update obs-normalization stats from the acted observations (network-input distribution).
-                if self.normalize_obs:
-                    self.obs_normalizer.update(
+                # Update obs-normalisation stats from the acted observations (network-input distribution).
+                if self.normalise_obs:
+                    self.obs_normaliser.update(
                         np.concatenate(
                             [np.asarray(raw_obs["observation"], dtype=np.float32),
                              np.asarray(raw_obs["desired_goal"], dtype=np.float32)],
@@ -487,7 +424,7 @@ class SACAgent():
                 # Mask placeholder reward on autoreset steps before accounting.
                 episode_rewards += np.where(is_autoreset, 0.0, reward)
 
-                # [PANDA] success comes from info["is_success"] (+ "_is_success" mask).
+                # In panda success comes from info["is_success"] (+ "_is_success" mask).
                 step_success = np.full(n_envs, np.nan, dtype=np.float32)
                 if "is_success" in infos:
                     succ_arr = np.asarray(infos["is_success"], dtype=np.float32)
@@ -538,7 +475,7 @@ class SACAgent():
                         c_loss_avg = float(np.mean(critic_loss_history)) if len(critic_loss_history) > 0 else float("nan")
                         a_loss_avg = float(np.mean(actor_loss_history)) if len(actor_loss_history) > 0 else float("nan")
                         alpha_val = float(self.log_alpha.exp().item())
-                        # [DIAG] entropy vs target_entropy, and batch success(reward==0) fraction.
+
                         ent_avg = float(np.mean(entropy_history)) if len(entropy_history) > 0 else float("nan")
                         r0_avg = float(np.mean(r0_frac_history)) if len(r0_frac_history) > 0 else float("nan")
 
@@ -562,11 +499,11 @@ class SACAgent():
 
                         obs_inputs_, actions_, rewards_, next_obs_inputs_, dones_ = batch
 
-                        # [PANDA] sample() returns RAW concat(observation, goal); normalize then tensorize
-                        # (same normalizer as the act-time fuse_observations, for consistency).
-                        if self.normalize_obs:
-                            obs_inputs_ = self.obs_normalizer.normalize(obs_inputs_)
-                            next_obs_inputs_ = self.obs_normalizer.normalize(next_obs_inputs_)
+                        # sample() returns RAW concat(observation, goal) so I normalise then convert to tensor 
+                        # (same normaliser as the act-time fuse_observations, for consistency).
+                        if self.normalise_obs:
+                            obs_inputs_ = self.obs_normaliser.normalise(obs_inputs_)
+                            next_obs_inputs_ = self.obs_normaliser.normalise(next_obs_inputs_)
                         tensor_obs = torch.as_tensor(obs_inputs_, dtype=torch.float32, device=self.device)
                         tensor_next_obs = torch.as_tensor(next_obs_inputs_, dtype=torch.float32, device=self.device)
                         tensor_actions = torch.as_tensor(actions_, dtype=torch.float32, device=self.device)
@@ -582,7 +519,6 @@ class SACAgent():
                         critic_loss_history.append(critic_loss)
                         actor_loss_history.append(actor_loss)
                         alpha_loss_history.append(alpha_loss)
-                        # [DIAG] rewards_ are 0.0 (success) or -1.0; fraction == 0 = signal reaching critic.
                         entropy_history.append(policy_entropy)
                         r0_frac_history.append(float(np.mean(rewards_ > -0.5)))
 
@@ -604,8 +540,8 @@ class SACAgent():
                         },
                         f"{alpha_dir}/{global_step}",
                     )
-                    if self.normalize_obs:
-                        torch.save(self.obs_normalizer.state_dict(), f"{norm_dir}/{global_step}")
+                    if self.normalise_obs:
+                        torch.save(self.obs_normaliser.state_dict(), f"{norm_dir}/{global_step}")
                 target_success_rate = 0.80
                 if len(success_history) == success_history.maxlen and float(np.mean(success_history)) >= target_success_rate:
                     torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}_solved")
@@ -617,10 +553,11 @@ class SACAgent():
                         },
                         f"{alpha_dir}/{global_step}_solved",
                     )
-                    if self.normalize_obs:
-                        torch.save(self.obs_normalizer.state_dict(), f"{norm_dir}/{global_step}_solved")
+                    if self.normalise_obs:
+                        torch.save(self.obs_normaliser.state_dict(), f"{norm_dir}/{global_step}_solved")
                     print(f"target success achieved: {np.mean(success_history):.3f}")
                     break
+                
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving current state...")
             torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}_interrupted")
@@ -632,16 +569,11 @@ class SACAgent():
                 },
                 f"{alpha_dir}/{global_step}_interrupted",
             )
-            if self.normalize_obs:
-                torch.save(self.obs_normalizer.state_dict(), f"{norm_dir}/{global_step}_interrupted")
+            if self.normalise_obs:
+                torch.save(self.obs_normaliser.state_dict(), f"{norm_dir}/{global_step}_interrupted")
             print(f"Models saved at step {global_step}. Exiting.")
 
 
-# Vectorized transition-capped episodic replay buffer (HER-compatible).
-# Replaces the deque-of-namedtuples design with flat preallocated numpy arrays so sample() can be
-# fully vectorized. Episodes are stored as CONTIGUOUS blocks (an episode that would straddle the
-# ring end is wrapped to slot 0 instead), so HER 'future' sampling within an episode is simple
-# contiguous arithmetic. Whole overlapping episodes are evicted when their slots get overwritten.
 class GlobalEpisodicReplayBuffer:
     def __init__(self, max_transitions, obs_dim, act_dim, goal_dim):
         self.capacity = int(max_transitions)
