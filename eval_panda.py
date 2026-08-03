@@ -29,7 +29,7 @@ def policy_action(actor, obs, device, normalizer=None, deterministic=True):
     # [PANDA] policy input = concat(observation, desired_goal); achieved_goal excluded.
     obs_input = np.concatenate([obs["observation"], obs["desired_goal"]]).astype(np.float32)
     if normalizer is not None:
-        obs_input = normalizer.normalize(obs_input[None, :])[0]
+        obs_input = normalizer.normalise(obs_input[None, :])[0]
     obs_tensor = torch.as_tensor(obs_input, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
         mean, log_sd = actor(obs_tensor)
@@ -102,13 +102,15 @@ def main():
 
     # Load the matching observation-normalizer stats (training normalized the network input).
     normalizer = None
-    norm_path = Path(models_dir) / "Normalizer" / ckpt.name
-    if norm_path.is_file():
+    # Older checkpoints used "Normalizer", the agent now writes "normaliser".
+    norm_paths = [Path(models_dir) / d / ckpt.name for d in ("normaliser", "Normalizer")]
+    norm_path = next((p for p in norm_paths if p.is_file()), None)
+    if norm_path is not None:
         normalizer = RunningMeanStd(obs_dim)
         normalizer.load_state_dict(torch.load(norm_path, map_location="cpu", weights_only=False))
         print(f"[eval] loaded normalizer stats: {norm_path}")
     else:
-        print(f"[eval] WARNING: no normalizer at {norm_path} — feeding UNNORMALIZED obs (policy may look broken)")
+        print(f"[eval] WARNING: no normalizer in {[str(p.parent) for p in norm_paths]} — feeding UNNORMALIZED obs (policy may look broken)")
 
     frames = []
     successes = []

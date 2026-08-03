@@ -90,7 +90,7 @@ class ActorNetwork(nn.Module):
             nn.ReLU()
         )
 
-        # Separating outputs for mean and log_sd # Why?
+        # Separating outputs for mean and log_sd 
         self.mean_layer = nn.Linear(hidden, act_dim)
         self.log_sd_layer = nn.Linear(hidden, act_dim)
 
