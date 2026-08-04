@@ -307,6 +307,50 @@ class SACAgent():
 
         return obs_inputs, actions, rewards, next_obs_inputs, dones
 
+    def load_demonstrations(self, demo_path):
+        """Seed the replay buffer with recorded expert episodes before training starts.
+
+        HER relabels goals onto achieved object positions, so while the cube is static
+        almost every relabeled goal is already satisfied and carries no gradient. Demos
+        are the cheapest source of transitions where the cube actually leaves the table,
+        which is what lets HER generate airborne relabeled goals at all.
+
+        Expects the layout scripted_expert.py --record writes (expert_demos.npz).
+        """
+        with np.load(demo_path) as data:
+            observation = data["observation"]
+            next_observation = data["next_observation"]
+            next_achieved_goal = data["next_achieved_goal"]
+            desired_goal = data["desired_goal"]
+            actions = data["actions"]
+            rewards = data["rewards"]
+            episode_index = data["episode_index"]
+
+        episodes = 0
+        for ep in np.unique(episode_index):
+            indices = np.flatnonzero(episode_index == ep)   # already in time order
+            self.replay_buffer.add_episode([
+                StepInfo(
+                    observation=observation[i],
+                    action=actions[i],
+                    reward=np.float32(rewards[i]),
+                    next_observation=next_observation[i],
+                    next_achieved_goal=next_achieved_goal[i],
+                    desired_goal=desired_goal[i],
+                    done=np.float32(0.0),  # [PANDA] non-terminal, same convention as online data
+                )
+                for i in indices
+            ])
+            episodes += 1
+
+        # Fold the demo observations into the normaliser too, so the very first updates
+        # aren't normalised by stats that have never seen a lifted cube.
+        if self.normalise_obs:
+            self.obs_normaliser.update(np.concatenate([observation, desired_goal], axis=1))
+
+        print(f"Seeded replay buffer with {episodes} demo episodes "
+              f"({len(episode_index)} transitions) from {demo_path}", flush=True)
+
     def load_checkpoint(self, model_path, timestep, load_critic=True):
         actor_path = os.path.join(model_path, "Actor", str(timestep))
         critic_path = os.path.join(model_path, "Critic", str(timestep))
@@ -338,7 +382,7 @@ class SACAgent():
 
         print(f"Loaded checkpoint at timestep {timestep}")
 
-    def train(self, model_path, save_timesteps=50000, start_timestep=0, debug_boundary=False):
+    def train(self, model_path, save_timesteps=50000, start_timestep=0, debug_boundary=False, target_success_rate=0.80):
         actor_dir = os.path.join(model_path, "Actor")
         critic_dir = os.path.join(model_path, "Critic")
         alpha_dir = os.path.join(model_path, "Alpha")
@@ -542,7 +586,6 @@ class SACAgent():
                     )
                     if self.normalise_obs:
                         torch.save(self.obs_normaliser.state_dict(), f"{norm_dir}/{global_step}")
-                target_success_rate = 0.80
                 if len(success_history) == success_history.maxlen and float(np.mean(success_history)) >= target_success_rate:
                     torch.save(self.Actor.state_dict(), f"{actor_dir}/{global_step}_solved")
                     torch.save(self.Critic.state_dict(), f"{critic_dir}/{global_step}_solved")

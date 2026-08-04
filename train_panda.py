@@ -41,6 +41,11 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4, help="Actor/critic learning rate (SAC default 3e-4; was 1e-4)")
     parser.add_argument("--warmup", type=int, default=15_000, help="Env-steps of uniform-random actions before using the actor")
     parser.add_argument("--her-ratio", type=float, default=0.8, help="Fraction of each batch that is HER future-relabeled (0.8 = standard; lower = more real-goal transitions)")
+    parser.add_argument("--demo-file", type=str, default=None,
+                        help="Seed the replay buffer from a recorded demo npz (e.g. expert_demos.npz) before training")
+    parser.add_argument("--target-success-rate", type=float, default=0.80,
+                        help="Success rate (trailing 100 episodes) that triggers an early '_solved' checkpoint + stop. "
+                             "Set > 1.0 (e.g. 2.0) to disable and always run the full --timesteps budget.")
     parser.add_argument("--models-dir", type=str, default=None, help="Checkpoint dir (default: models/SAC_<env>)")
     parser.add_argument("--debug-boundary", action="store_true", help="Print one-shot env-boundary shape/dtype debug on the first step")
     args = parser.parse_args()
@@ -78,11 +83,15 @@ def main():
         model.load_checkpoint(models_dir, args.resume_step)
         start_timestep = args.resume_step
 
+    if args.demo_file is not None:
+        model.load_demonstrations(args.demo_file)
+
     model.train(
         models_dir,
         save_timesteps=args.save_timesteps,
         start_timestep=start_timestep,
         debug_boundary=args.debug_boundary,
+        target_success_rate=args.target_success_rate,
     )
 
     env.close()

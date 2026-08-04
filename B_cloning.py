@@ -120,8 +120,7 @@ class BC():
         train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True)
         test_loader = DataLoader(test_ds, batch_size=self.batch_size, shuffle=False)
 
-        print(f"train transitions: {len(train_ds)} | test transitions: {len(test_ds)} "
-              f"| episodes: {len(np.unique(episode_index))}")
+        print(f"train transitions: {len(train_ds)} | test transitions: {len(test_ds)} | episodes: {len(np.unique(episode_index))}")
 
         return train_loader, test_loader
 
@@ -145,7 +144,7 @@ class BC():
             return torch.tanh(mean).squeeze(0).cpu().numpy().astype(np.float32)
 
     def evaluate(self, env, episodes=20):
-        # Held out loss only says how well we copy the expert, this says whether the task gets solved
+        # Evaluate on env itself
         self.Actor.eval()
         successes = []
         for episode in range(episodes):
@@ -192,7 +191,6 @@ class BC():
 
                 test_loss /= len(test_loader)
 
-            ## Print out what's happening
             print(f"\nTrain loss: {train_loss:.5f} | Test loss: {test_loss:.5f}")
 
             if test_loss < best_test_loss:
