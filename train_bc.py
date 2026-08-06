@@ -10,7 +10,6 @@ import torch
 
 from B_cloning import BC
 
-# Windows consoles default to cp1252, force UTF-8 so redirecting to a log file
 # doesn't crash on encode.
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -20,12 +19,10 @@ except Exception:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, default="PandaPickAndPlace-v3",
-                        help="panda-gym goal env id (match the one the demos were recorded on)")
+    parser.add_argument("--env", type=str, default="PandaPickAndPlace-v3", help="panda-gym goal env id (match the one the demos were recorded on)")
     parser.add_argument("--demos", type=str, default="expert_demos.npz", help="Expert demo .npz")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64,
-                        help="Small on purpose, ~3k demo transitions means a big batch gives too few updates per epoch")
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save-epochs", type=int, default=5, help="Checkpoint + rollout eval interval (epochs)")
     parser.add_argument("--eval-episodes", type=int, default=20, help="Rollout episodes per eval (0 = loss only)")

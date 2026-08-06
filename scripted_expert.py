@@ -1,5 +1,5 @@
 """
-Scripted expert for panda-gym's `PandaPickAndPlace-v3`.
+Claude Scripted expert for panda-gym's `PandaPickAndPlace-v3`.
 
 Uses privileged state (object / gripper / goal positions from the obs dict) to
 drive a state-machine + proportional controller. Generates demonstrations for

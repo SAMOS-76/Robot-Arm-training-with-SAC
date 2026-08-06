@@ -1,14 +1,13 @@
 """
-Evaluate / capture a SAC actor checkpoint on PandaPickAndPlace-v3.
+Roll out an actor checkpoint on PandaPickAndPlace-v3 and write a GIF.
 
-Rolls out the policy on an rgb_array env and writes a GIF (and prints success
-rate) so you can produce a demo clip. Replaces test_stack.py, which used the
-MuJoCo viewer specific to the custom stacking env.
+Prints the success rate over the rollout episodes, so the same command doubles as a
+quick eyeball check and a way to produce a demo clip. Works for SAC and BC checkpoints
+alike, they share the actor architecture.
 
     python eval_panda.py --checkpoint 50000 --episodes 5
 """
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -19,26 +18,38 @@ except Exception:
 
 import gymnasium as gym
 import numpy as np
-import panda_gym  
+import panda_gym  # noqa: F401
 import torch
+from torch.distributions import Normal
 
 from SAC_agent_HER_panda import ActorNetwork, RunningMeanStd
 
 
-def policy_action(actor, obs, device, normalizer=None, deterministic=True):
-    # [PANDA] policy input = concat(observation, desired_goal); achieved_goal excluded.
+def policy_action(actor, obs, device, normaliser=None, deterministic=True):
+    # Policy input = concat(observation, desired_goal); achieved_goal excluded
     obs_input = np.concatenate([obs["observation"], obs["desired_goal"]]).astype(np.float32)
-    if normalizer is not None:
-        obs_input = normalizer.normalise(obs_input[None, :])[0]
+    if normaliser is not None:
+        obs_input = normaliser.normalise(obs_input[None, :])[0]
     obs_tensor = torch.as_tensor(obs_input, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
         mean, log_sd = actor(obs_tensor)
-        if deterministic:
-            action = torch.tanh(mean)
-        else:
-            from torch.distributions import Normal
-            action = torch.tanh(Normal(mean, log_sd.exp()).sample())
+        action = torch.tanh(mean) if deterministic else torch.tanh(Normal(mean, log_sd.exp()).sample())
     return action.squeeze(0).cpu().numpy().astype(np.float32)
+
+
+def resolve_checkpoint(actor_dir, name):
+    # Named checkpoint if it exists, otherwise the highest numeric one
+    if name and (actor_dir / name).is_file():
+        return actor_dir / name
+    numbered = [(int(p.name.split("_")[0]), p) for p in sorted(actor_dir.glob("*"))
+                if p.is_file() and p.name.split("_")[0].isdigit()]
+    if not numbered:
+        raise FileNotFoundError(f"No actor checkpoints in {actor_dir}")
+    if name:
+        match = [p for step, p in numbered if str(step) == name]
+        if match:
+            return match[-1]
+    return max(numbered, key=lambda x: x[0])[1]
 
 
 def save_gif(frames, path, fps=25):
@@ -71,26 +82,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    models_dir = args.models_dir or f"models/SAC_{args.env}"
+    models_dir = Path(args.models_dir or f"models/SAC_{args.env}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    actor_dir = Path(models_dir) / "Actor"
-
-    # Resolve checkpoint (latest numeric if unspecified).
-    if args.checkpoint and (actor_dir / args.checkpoint).is_file():
-        ckpt = actor_dir / args.checkpoint
-    else:
-        cands = []
-        for c in actor_dir.iterdir() if actor_dir.is_dir() else []:
-            head = c.name.split("_")[0]
-            if c.is_file() and head.isdigit():
-                cands.append((int(head), c))
-        if not cands:
-            raise FileNotFoundError(f"No actor checkpoints in {actor_dir}")
-        if args.checkpoint:
-            match = [c for s, c in cands if str(s) == args.checkpoint]
-            ckpt = match[-1] if match else max(cands, key=lambda x: x[0])[1]
-        else:
-            ckpt = max(cands, key=lambda x: x[0])[1]
+    ckpt = resolve_checkpoint(models_dir / "Actor", args.checkpoint)
 
     env = gym.make(args.env, render_mode="rgb_array")
     obs_dim = env.observation_space["observation"].shape[0] + env.observation_space["desired_goal"].shape[0]
@@ -100,27 +94,26 @@ def main():
     actor.eval()
     print(f"[eval] loaded {ckpt} | obs_dim={obs_dim} act_dim={act_dim} | device={device}")
 
-    # Load the matching observation-normalizer stats (training normalized the network input).
-    normalizer = None
+    # Training normalised the network input, so the matching stats have to come along.
     # Older checkpoints used "Normalizer", the agent now writes "normaliser".
-    norm_paths = [Path(models_dir) / d / ckpt.name for d in ("normaliser", "Normalizer")]
+    norm_paths = [models_dir / d / ckpt.name for d in ("normaliser", "Normalizer")]
     norm_path = next((p for p in norm_paths if p.is_file()), None)
+    normaliser = None
     if norm_path is not None:
-        normalizer = RunningMeanStd(obs_dim)
-        normalizer.load_state_dict(torch.load(norm_path, map_location="cpu", weights_only=False))
-        print(f"[eval] loaded normalizer stats: {norm_path}")
+        normaliser = RunningMeanStd(obs_dim)
+        normaliser.load_state_dict(torch.load(norm_path, map_location="cpu", weights_only=False))
+        print(f"[eval] loaded normaliser stats: {norm_path}")
     else:
-        print(f"[eval] WARNING: no normalizer in {[str(p.parent) for p in norm_paths]} — feeding UNNORMALIZED obs (policy may look broken)")
+        print(f"[eval] WARNING: no normaliser in {[str(p.parent) for p in norm_paths]} — feeding UNNORMALISED obs (policy may look broken)")
 
-    frames = []
-    successes = []
+    frames, successes = [], []
     for ep in range(args.episodes):
         obs, _ = env.reset(seed=args.seed + ep)
         done = False
         ep_success = False
         while not done:
             frames.append(np.asarray(env.render()))
-            action = policy_action(actor, obs, device, normalizer=normalizer, deterministic=not args.stochastic)
+            action = policy_action(actor, obs, device, normaliser=normaliser, deterministic=not args.stochastic)
             obs, reward, terminated, truncated, info = env.step(action)
             ep_success = ep_success or bool(info.get("is_success", False))
             done = bool(terminated or truncated)

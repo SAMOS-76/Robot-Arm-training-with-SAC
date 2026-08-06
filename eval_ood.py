@@ -1,39 +1,19 @@
-"""
-Out-of-distribution generalisation comparison on `PandaPickAndPlace-v3`:
-behaviour cloning vs SAC+HER, with the scripted expert as a feasibility ceiling.
+r"""
+Out-of-distribution generalisation sweep on PandaPickAndPlace-v3.
 
-Standalone and evaluation-only -- does not touch B_cloning.py / train_bc.py /
-SAC_agent_HER_panda.py / eval_panda.py / scripted_expert.py.
+Any number of learned actors are compared against the scripted expert, which acts as a
+feasibility ceiling rather than a competitor. Every arm replays the same pre-generated
+scene table, so the comparison is paired and McNemar's exact test applies.
 
-WHY: panda-gym samples object and goal xy uniformly in a +-0.15 m square about
-the table centre (tasks/pick_and_place.py: obj_xy_range=0.3, goal_xy_range=0.3),
-and goal z in [0, 0.2] forced flat 30% of the time. Both the expert demos and the
-default eval loops draw from exactly that distribution, so the headline success
-rate says nothing about what happens when the scene moves outside it.
-
-HOW: PandaPickAndPlaceEnv never forwards the range kwargs to the task
-(panda_tasks.py:103 builds `PickAndPlace(sim, reward_type=reward_type)`), so they
-cannot be set via gym.make. But `_sample_object` / `_sample_goal` are read off
-`self` at every reset, so replacing the two bound methods on the task instance is
-enough -- no subclassing, no gym registry surgery.
-
-The samplers installed here return positions from a PRE-GENERATED scene table
-rather than drawing fresh randomness. That is the point: every arm replays the
-identical scenes, so the comparison is paired and McNemar's exact test applies.
-If each policy drew from the env RNG instead, two policies consuming different
-numbers of draws would silently desynchronise the scenes.
-
-Geometry: positions are centre + r*(cos t, sin t) with t restricted to the SAME
-arc [48.2 deg, 311.8 deg] at every radius. The table ends at x = +0.25, so a full
-ring is impossible past r ~ 0.20; rejecting per-radius instead would make the
-angular distribution co-vary with radius and confound distance with direction.
-Experiment 1 (untouched default sampling) recovers the excluded +x wedge.
-
-    python eval_ood.py --sanity      # position checks, replay check, expert probe
-    python eval_ood.py               # all three experiments + csv + plots
+    python eval_ood.py --sanity
+    python eval_ood.py
+    python eval_ood.py --arm BC models/BC_PandaPickAndPlace-v3 95_best \
+                       --arm "SAC+HER (no demo)" models/SAC_PandaPickAndPlace-v3 291904_interrupted \
+                       --arm "SAC+HER (demo-seeded)" models/SAC_PickPlace_v3 4999_solved
 """
 import argparse
 import csv
+import itertools
 import platform
 import sys
 import time
@@ -45,7 +25,7 @@ import panda_gym  # noqa: F401  (registers PandaPickAndPlace-v3)
 import torch
 from scipy.stats import binomtest
 
-from B_cloning import ActorNetwork, RunningMeanStd
+from SAC_agent_HER_panda import ActorNetwork, RunningMeanStd
 from scripted_expert import ScriptedExpert
 
 # Windows consoles default to cp1252; force UTF-8 so redirecting logs doesn't crash.
@@ -56,7 +36,7 @@ except Exception:
 
 ENV_ID = "PandaPickAndPlace-v3"
 
-CUBE_HALF = 0.02          # object_size 0.04 / 2 -- also the resting cube-centre z
+CUBE_HALF = 0.02          # object_size 0.04 / 2, also the resting cube-centre z
 MIN_SEPARATION = 0.05     # == task.distance_threshold; closer than this auto-succeeds at step 1
 
 # Table top spans x in [-0.85, 0.25], y in [-0.35, 0.35] (pybullet.py create_table:
@@ -66,8 +46,9 @@ SAFE_X = (-0.85 + 0.03 + CUBE_HALF, 0.25 - 0.03 - CUBE_HALF)   # (-0.80, 0.20)
 SAFE_Y = (-0.35 + 0.03 + CUBE_HALF, 0.35 - 0.03 - CUBE_HALF)   # (-0.30, 0.30)
 
 # Fixed safe arc, identical at every radius: cos(t) <= 0.20 / r_max with r_max = 0.30.
-# Excludes a 96.4 deg wedge around +x. Beyond r = 0.30 the y-bound also binds and the
-# safe region splits into two disconnected arcs, so 0.30 is the cap.
+# Excludes a 96.4 deg wedge around +x. Rejecting per-radius instead would make the
+# angular distribution co-vary with radius and confound distance with direction.
+# Beyond r = 0.30 the y-bound also binds and the safe region splits in two, so 0.30 is the cap.
 THETA_LO = np.deg2rad(48.2)
 THETA_HI = np.deg2rad(311.8)
 
@@ -83,27 +64,32 @@ TRAIN_Z_CEILING = CUBE_HALF + GOAL_Z_RANGE   # 0.22 absolute
 SCENE_RNG_SEED = 12345
 BASE_SEED = 20_000        # clear of the demo seeds 0-199 (scripted_expert.py record())
 
-ARMS = ["BC", "SAC+HER", "expert"]
-ARM_COLOUR = {"BC": "#2a78d6", "SAC+HER": "#eb6834", "expert": "#1baf7a"}
-ARM_MARKER = {"BC": "o", "SAC+HER": "s", "expert": "^"}
+EXPERT = "expert"
+DEFAULT_ARMS = [("BC", f"models/BC_{ENV_ID}", "95_best"),
+                ("SAC+HER", f"models/SAC_{ENV_ID}", "291904_interrupted")]
+
+# Learned arms take palette slots in the order they are given. Slot 3 is violet rather
+# than the yellow that would sit next to orange, so two SAC arms stay well apart.
+ARM_PALETTE = ["#2a78d6", "#eb6834", "#4a3aa7", "#c2358f", "#7a5c1e"]
+ARM_MARKERS = ["o", "s", "D", "v", "P"]
+EXPERT_STYLE = ("#1baf7a", "^")
 
 # Chart chrome (light surface).
 SURFACE, INK, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7"
 
+HOLD_STILL = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
-# --------------------------------------------------------------------------- #
-# scene table
-# --------------------------------------------------------------------------- #
+
 def in_safe_rect(xy):
     return (SAFE_X[0] <= xy[0] <= SAFE_X[1]) and (SAFE_Y[0] <= xy[1] <= SAFE_Y[1])
 
 
-def _ring_xy(r, theta):
+def ring_xy(r, theta):
     return np.array([r * np.cos(theta), r * np.sin(theta)])
 
 
-def _default_goal_z(rng):
-    """panda-gym's goal-z distribution, drawn from our own rng."""
+def default_goal_z(rng):
+    # panda-gym's goal-z distribution, drawn from our own rng
     z = rng.uniform(0.0, GOAL_Z_RANGE)
     if rng.random() < GOAL_Z_FLAT_PROB:
         z = 0.0
@@ -121,24 +107,23 @@ def generate_ring_scenes(rng, n, radius, goal_z=None):
     while len(objects) < n:
         th_o = rng.uniform(THETA_LO, THETA_HI)
         th_g = rng.uniform(THETA_LO, THETA_HI)
-        z = _default_goal_z(rng) if goal_z is None else float(goal_z)
-        obj = np.append(_ring_xy(radius, th_o), CUBE_HALF)
-        goal = np.append(_ring_xy(radius, th_g), z)
+        z = default_goal_z(rng) if goal_z is None else float(goal_z)
+        obj = np.append(ring_xy(radius, th_o), CUBE_HALF)
+        goal = np.append(ring_xy(radius, th_g), z)
         if np.linalg.norm(obj - goal) < MIN_SEPARATION:
             rejected += 1
             continue
         objects.append(obj)
         goals.append(goal)
         thetas.append([th_o, th_g, z])
-    return (np.asarray(objects), np.asarray(goals), np.asarray(thetas), rejected)
+    return np.asarray(objects), np.asarray(goals), np.asarray(thetas), rejected
 
 
 def generate_default_scenes(n, base_seed):
     """Experiment 1: untouched panda-gym sampling, indexed by env seed.
 
-    Walks seeds upward from base_seed, keeping those whose scene is not degenerate.
-    Returns the accepted seed list plus the positions each seed produces, so the
-    identical scenes can be replayed by (and archived alongside) every arm.
+    Walks seeds upward from base_seed, keeping those whose scene is not degenerate, so
+    the identical scenes can be replayed by (and archived alongside) every arm.
     """
     env = gym.make(ENV_ID)
     seeds, objects, goals, rejected, seed = [], [], [], 0, base_seed
@@ -157,7 +142,7 @@ def generate_default_scenes(n, base_seed):
 
 
 def build_scene_table(n_default, n_ring):
-    """Pre-generate every scene for every experiment. One rng, fixed seed."""
+    # Every scene for every experiment, from one rng with a fixed seed
     rng = np.random.default_rng(SCENE_RNG_SEED)
     table, rejects = {}, {}
 
@@ -181,11 +166,11 @@ def build_scene_table(n_default, n_ring):
 
     table["_rejected_keys"] = np.asarray(list(rejects.keys()))
     table["_rejected_counts"] = np.asarray(list(rejects.values()))
-    return table, rejects
+    return table
 
 
-def save_scenes(table, path):
-    np.savez_compressed(path, **table)
+def scene_rejects(table):
+    return dict(zip(table["_rejected_keys"].tolist(), table["_rejected_counts"].tolist()))
 
 
 def load_scenes(path):
@@ -193,9 +178,39 @@ def load_scenes(path):
         return {k: data[k] for k in data.files}
 
 
-# --------------------------------------------------------------------------- #
-# policies
-# --------------------------------------------------------------------------- #
+def get_scene_table(path, n_default, n_ring, regenerate):
+    """Load the archived table if it exists, otherwise generate and save it.
+
+    Regenerating with different episode counts changes every scene, which would silently
+    break pairing against results already written from the archived table.
+    """
+    if regenerate or not Path(path).is_file():
+        table = build_scene_table(n_default, n_ring)
+        np.savez_compressed(path, **table)
+        rejects = scene_rejects(table)
+        total_scenes = n_default + n_ring * (len(RADII) + len(GOAL_ZS))
+        print(f"  rng            np.random.default_rng({SCENE_RNG_SEED})")
+        print(f"  arc            [{np.rad2deg(THETA_LO):.1f}, {np.rad2deg(THETA_HI):.1f}] deg "
+              f"({np.rad2deg(THETA_HI - THETA_LO):.1f} deg wide)")
+        print(f"  scenes         {total_scenes} across {1 + len(RADII) + len(GOAL_ZS)} bins")
+        print(f"  rejected       {sum(rejects.values())} (initial separation < {MIN_SEPARATION} m)")
+        print(f"  archived to    {path}")
+    else:
+        table = load_scenes(path)
+        print(f"  loaded         {path} ({len(table)} arrays, --regen-scenes to rebuild)")
+    return table, scene_rejects(table)
+
+
+def check_scene_counts(table, episodes, exp1_episodes):
+    # An archived table can be smaller than the requested episode counts
+    per_bin = len(table[f"exp2_r{RADII[0]:.2f}_object"])
+    exp1 = len(table["exp1_seeds"])
+    if episodes > per_bin or exp1_episodes > exp1:
+        raise SystemExit(f"Scene table holds {per_bin} scenes per swept bin and {exp1} for exp1, "
+                         f"fewer than requested (--episodes {episodes}, --exp1-episodes {exp1_episodes}). "
+                         f"Rerun with --regen-scenes to build a bigger table.")
+
+
 def load_actor(models_dir, ckpt, obs_dim, act_dim, device):
     """Load an actor plus ITS OWN normaliser stats.
 
@@ -224,7 +239,7 @@ def load_actor(models_dir, ckpt, obs_dim, act_dim, device):
 
 
 class NetPolicy:
-    """Deterministic tanh(mean) actor. No sampling anywhere."""
+    # Deterministic tanh(mean) actor, no sampling anywhere
 
     def __init__(self, actor, normaliser, device):
         self.actor, self.normaliser, self.device = actor, normaliser, device
@@ -254,9 +269,23 @@ class ExpertPolicy:
         return self.expert.act(obs)
 
 
-# --------------------------------------------------------------------------- #
-# rollout
-# --------------------------------------------------------------------------- #
+def build_policies(arm_specs, obs_dim, act_dim, device):
+    policies = {}
+    for name, models_dir, ckpt in arm_specs:
+        print(name)
+        actor, normaliser = load_actor(models_dir, ckpt, obs_dim, act_dim, device)
+        policies[name] = NetPolicy(actor, normaliser, device)
+    policies[EXPERT] = ExpertPolicy()
+    return policies
+
+
+def arm_styles(arms):
+    styles = {EXPERT: EXPERT_STYLE}
+    for i, arm in enumerate([a for a in arms if a != EXPERT]):
+        styles[arm] = (ARM_PALETTE[i % len(ARM_PALETTE)], ARM_MARKERS[i % len(ARM_MARKERS)])
+    return styles
+
+
 class SceneInjector:
     """Replaces the task's samplers so reset() places object/goal from the table.
 
@@ -276,48 +305,42 @@ class SceneInjector:
 
 
 def rollout(env, policy, seed):
-    """One episode. Returns (success, steps, final_distance, initial_obs)."""
     obs, info = env.reset(seed=seed)
     if hasattr(policy, "reset"):
         policy.reset()
-    initial = {"object": obs["achieved_goal"].copy(), "goal": obs["desired_goal"].copy()}
     success = bool(info.get("is_success", False))
-    steps, done = 0, False
+    done = False
     while not done:
         obs, _, terminated, truncated, info = env.step(policy(obs))
-        steps += 1
         success = success or bool(info.get("is_success", False))
         done = bool(terminated or truncated)
     final_distance = float(np.linalg.norm(obs["achieved_goal"] - obs["desired_goal"]))
-    return success, steps, final_distance, initial
+    return success, final_distance
 
 
 def run_bin(env, policy, objects, goals, injector, episodes, seed0):
-    """Replay the first `episodes` scenes of one bin with one policy."""
+    # Replay the first `episodes` scenes of one bin with one policy
     successes, distances = [], []
     for ep in range(episodes):
         injector.set(objects[ep], goals[ep])
-        ok, _, dist, _ = rollout(env, policy, seed=seed0 + ep)
+        ok, dist = rollout(env, policy, seed=seed0 + ep)
         successes.append(bool(ok))
         distances.append(dist)
     return np.asarray(successes), np.asarray(distances)
 
 
 def run_default_bin(env, policy, seeds):
-    """Experiment 1: replay the accepted default-sampling seeds."""
     successes, distances = [], []
     for seed in seeds:
-        ok, _, dist, _ = rollout(env, policy, seed=int(seed))
+        ok, dist = rollout(env, policy, seed=int(seed))
         successes.append(bool(ok))
         distances.append(dist)
     return np.asarray(successes), np.asarray(distances)
 
 
-# --------------------------------------------------------------------------- #
-# statistics
-# --------------------------------------------------------------------------- #
 def wilson_interval(successes, n, z=1.959963984540054):
-    """Wilson score 95% interval. Implemented directly -- only numpy/scipy assumed."""
+    # Wilson score 95% interval, implemented directly so only numpy/scipy are assumed.
+    # Several bins sit at 0% or 100%, where the normal approximation is degenerate.
     if n == 0:
         return float("nan"), float("nan")
     p = successes / n
@@ -330,7 +353,7 @@ def wilson_interval(successes, n, z=1.959963984540054):
 
 
 def mcnemar(a_success, b_success):
-    """Exact McNemar on paired binary outcomes. b = a-only wins, c = b-only wins."""
+    # Exact McNemar on paired binary outcomes. b = a-only wins, c = b-only wins.
     b = int(np.sum(a_success & ~b_success))
     c = int(np.sum(~a_success & b_success))
     p = float(binomtest(b, b + c, 0.5).pvalue) if (b + c) > 0 else 1.0
@@ -355,11 +378,8 @@ def summarise(successes, distances, rejected):
     }
 
 
-# --------------------------------------------------------------------------- #
-# sanity checks
-# --------------------------------------------------------------------------- #
-def sanity(table, rejects, expert_episodes, settle_steps=5):
-    """Position validity, replay determinism, and an expert feasibility probe."""
+def sanity(table, rejects, scenes_path, expert_episodes, settle_steps=5):
+    # Position validity, replay determinism, and an expert feasibility probe
     print("\n" + "=" * 78)
     print("SANITY 1/3 -- sampled positions per bin")
     print("=" * 78)
@@ -368,15 +388,14 @@ def sanity(table, rejects, expert_episodes, settle_steps=5):
 
     env = gym.make(ENV_ID)
     injector = SceneInjector(env)
-    hold_still = lambda obs: np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
     all_ok = True
 
-    bins = ([("exp2", f"r={r:.2f}", f"exp2_r{r:.2f}") for r in RADII]
-            + [("exp3", f"z={z:.2f}", f"exp3_z{z:.2f}") for z in GOAL_ZS])
+    bins = ([(f"r={r:.2f}", f"exp2_r{r:.2f}") for r in RADII]
+            + [(f"z={z:.2f}", f"exp3_z{z:.2f}") for z in GOAL_ZS])
 
     print(f"{'bin':<14}{'obj x':>16}{'obj y':>16}{'goal z':>14}{'sep':>8}{'z after settle':>17}  ")
     print("-" * 78)
-    for _, label, key in bins:
+    for label, key in bins:
         obj, goal = table[f"{key}_object"], table[f"{key}_goal"]
         rect_ok = all(in_safe_rect(p[:2]) for p in obj) and all(in_safe_rect(p[:2]) for p in goal)
         sep = np.linalg.norm(obj - goal, axis=1)
@@ -387,7 +406,7 @@ def sanity(table, rejects, expert_episodes, settle_steps=5):
             injector.set(obj[ep], goal[ep])
             o, _ = env.reset(seed=BASE_SEED + ep)
             for _ in range(settle_steps):
-                o, *_ = env.step(hold_still(o))
+                o, *_ = env.step(HOLD_STILL)
             settled.append(float(o["achieved_goal"][2]))
         settled = np.asarray(settled)
         z_ok = bool(np.all(np.abs(settled - CUBE_HALF) < 0.01))
@@ -412,7 +431,7 @@ def sanity(table, rejects, expert_episodes, settle_steps=5):
     print("\n" + "=" * 78)
     print("SANITY 2/3 -- scene table replays identically across two loads")
     print("=" * 78)
-    a, b = load_scenes("ood_scenes.npz"), load_scenes("ood_scenes.npz")
+    a, b = load_scenes(scenes_path), load_scenes(scenes_path)
     identical = (a.keys() == b.keys()) and all(np.array_equal(a[k], b[k]) for k in a)
     matches_memory = all(np.array_equal(a[k], table[k]) for k in table if k in a)
     print(f"  load-vs-load identical: {'OK' if identical else 'FAIL'}  ({len(a)} arrays)")
@@ -422,12 +441,11 @@ def sanity(table, rejects, expert_episodes, settle_steps=5):
     print(f"SANITY 3/3 -- scripted expert feasibility probe ({expert_episodes} eps/bin)")
     print("=" * 78)
     expert = ExpertPolicy()
-    probe, low = {}, []
-    for _, label, key in bins:
+    low = []
+    for label, key in bins:
         succ, _ = run_bin(env, expert, table[f"{key}_object"], table[f"{key}_goal"],
                           injector, expert_episodes, BASE_SEED)
         rate = float(np.mean(succ))
-        probe[label] = rate
         if rate < 0.8:
             low.append((label, rate))
         print(f"  {label:<12} expert {rate:6.1%}")
@@ -438,139 +456,85 @@ def sanity(table, rejects, expert_episodes, settle_steps=5):
               + ", ".join(f"{lbl} ({r:.0%})" for lbl, r in low))
     else:
         print("\n  expert near-ceiling in every bin -- all bins physically feasible")
-    return all_ok and identical and matches_memory, probe, low
+    return all_ok and identical and matches_memory, low
 
 
-# --------------------------------------------------------------------------- #
-# experiments
-# --------------------------------------------------------------------------- #
-def print_bin_summary(title, rows):
-    print(f"\n  {title}")
-    print(f"  {'bin':<12}{'arm':<10}{'n':>5}{'success':>10}{'95% CI':>18}"
-          f"{'fail d̄':>10}{'fail med':>10}")
-    print("  " + "-" * 73)
-    for r in rows:
-        ci = f"[{r['wilson_lo']:.2f}, {r['wilson_hi']:.2f}]"
-        print(f"  {r['bin_label']:<12}{r['arm']:<10}{r['episodes']:>5}"
-              f"{r['success_rate']:>10.1%}{ci:>18}"
-              f"{r['fail_dist_mean']:>10.3f}{r['fail_dist_median']:>10.3f}")
+def run_experiment(table, rejects, policies, arms, exp_key, bins,
+                   episodes, expert_episodes, default_sampling=False):
+    """One experiment across all arms. Returns summary rows plus raw successes per bin.
 
-
-def experiment_1(table, rejects, policies, episodes):
-    """Default distribution -- the headline in-distribution number."""
-    print("\n" + "=" * 78)
-    print("EXPERIMENT 1 -- default panda-gym distribution")
-    print("=" * 78)
-    started = time.perf_counter()
+    Each experiment gets a fresh env. panda-gym repositions the cube with
+    resetBasePositionAndOrientation, which does not zero its velocity, so a cube still
+    moving at the end of one episode leaks into the next reset. Sharing an env across
+    experiments would make the first bin of each depend on how the previous one ended.
+    Experiment 1 also needs an unpatched env: SceneInjector permanently overwrites the
+    task samplers, so default sampling would return its constant scene on every reset.
+    """
     env = gym.make(ENV_ID)
-    seeds = table["exp1_seeds"][:episodes]
-    rows, raw = [], {}
-    for arm in ARMS:
-        succ, dist = run_default_bin(env, policies[arm], seeds)
-        raw[arm] = succ
-        row = {"experiment": "exp1", "bin_label": "default", "bin_value": float("nan"),
-               "arm": arm, **summarise(succ, dist, rejects["exp1/default"])}
-        rows.append(row)
-    env.close()
-    b, c, p = mcnemar(raw["BC"], raw["SAC+HER"])
-    for row in rows:
-        row.update(mcnemar_b=b if row["arm"] == "BC" else "",
-                   mcnemar_c=c if row["arm"] == "BC" else "",
-                   mcnemar_p=p if row["arm"] == "BC" else "")
-    elapsed = time.perf_counter() - started
-    print_bin_summary(f"default distribution, {len(seeds)} paired episodes/arm", rows)
-    print(f"\n  McNemar BC vs SAC+HER: b={b} (BC only) c={c} (SAC only) p={p:.4g}")
-    print(f"  elapsed {elapsed:.1f}s")
-    return rows, elapsed
-
-
-def experiment_2(table, rejects, policies, episodes, expert_episodes):
-    """Radius sweep -- the primary OOD axis."""
-    print("\n" + "=" * 78)
-    print("EXPERIMENT 2 -- radius sweep (object and goal on a ring)")
-    print("=" * 78)
-    started = time.perf_counter()
-    env = gym.make(ENV_ID)
-    injector = SceneInjector(env)
-    rows = []
-    for r in RADII:
-        key, label = f"exp2_r{r:.2f}", f"r={r:.2f}"
-        obj, goal = table[f"{key}_object"], table[f"{key}_goal"]
-        raw, bin_rows = {}, []
-        for arm in ARMS:
-            n = expert_episodes if arm == "expert" else episodes
-            succ, dist = run_bin(env, policies[arm], obj, goal, injector, n, BASE_SEED)
+    injector = None if default_sampling else SceneInjector(env)
+    rows, raw_by_bin = [], {}
+    for bin_key, label, bin_value in bins:
+        raw = {}
+        rejected = int(rejects.get(f"{exp_key}/{label}", 0))
+        for arm in arms:
+            if default_sampling:
+                succ, dist = run_default_bin(env, policies[arm], table["exp1_seeds"][:episodes])
+            else:
+                n = expert_episodes if arm == EXPERT else episodes
+                succ, dist = run_bin(env, policies[arm], table[f"{bin_key}_object"],
+                                     table[f"{bin_key}_goal"], injector, n, BASE_SEED)
             raw[arm] = succ
-            bin_rows.append({"experiment": "exp2", "bin_label": label, "bin_value": r,
-                             "arm": arm, **summarise(succ, dist, rejects[f"exp2/r={r:.2f}"])})
-        b, c, p = mcnemar(raw["BC"], raw["SAC+HER"])
-        for row in bin_rows:
-            row.update(mcnemar_b=b if row["arm"] == "BC" else "",
-                       mcnemar_c=c if row["arm"] == "BC" else "",
-                       mcnemar_p=p if row["arm"] == "BC" else "")
-        rows.extend(bin_rows)
-        print(f"  r={r:.2f}  BC {bin_rows[0]['success_rate']:6.1%} | "
-              f"SAC {bin_rows[1]['success_rate']:6.1%} | "
-              f"expert {bin_rows[2]['success_rate']:6.1%} | McNemar p={p:.4g}")
+            rows.append({"experiment": exp_key, "bin_label": label, "bin_value": bin_value,
+                         "arm": arm, **summarise(succ, dist, rejected)})
+        raw_by_bin[label] = raw
     env.close()
-    elapsed = time.perf_counter() - started
-    print_bin_summary("radius sweep", rows)
-    print(f"\n  elapsed {elapsed:.1f}s")
-    return rows, elapsed
+    return rows, raw_by_bin
 
 
-def experiment_3(table, rejects, policies, episodes, expert_episodes):
-    """Goal-height sweep -- a second OOD axis, xy held in-distribution."""
-    print("\n" + "=" * 78)
-    print(f"EXPERIMENT 3 -- goal height sweep (xy fixed at r={HEIGHT_SWEEP_RADIUS:.2f})")
-    print("=" * 78)
-    started = time.perf_counter()
-    env = gym.make(ENV_ID)
-    injector = SceneInjector(env)
-    rows = []
-    for z in GOAL_ZS:
-        key, label = f"exp3_z{z:.2f}", f"z={z:.2f}"
-        obj, goal = table[f"{key}_object"], table[f"{key}_goal"]
-        raw, bin_rows = {}, []
-        for arm in ARMS:
-            n = expert_episodes if arm == "expert" else episodes
-            succ, dist = run_bin(env, policies[arm], obj, goal, injector, n, BASE_SEED)
-            raw[arm] = succ
-            bin_rows.append({"experiment": "exp3", "bin_label": label, "bin_value": z,
-                             "arm": arm, **summarise(succ, dist, rejects[f"exp3/z={z:.2f}"])})
-        b, c, p = mcnemar(raw["BC"], raw["SAC+HER"])
-        for row in bin_rows:
-            row.update(mcnemar_b=b if row["arm"] == "BC" else "",
-                       mcnemar_c=c if row["arm"] == "BC" else "",
-                       mcnemar_p=p if row["arm"] == "BC" else "")
-        rows.extend(bin_rows)
-        print(f"  z={z:.2f}  BC {bin_rows[0]['success_rate']:6.1%} | "
-              f"SAC {bin_rows[1]['success_rate']:6.1%} | "
-              f"expert {bin_rows[2]['success_rate']:6.1%} | McNemar p={p:.4g}")
-    env.close()
-    elapsed = time.perf_counter() - started
-    print_bin_summary("goal height sweep", rows)
-    print(f"\n  elapsed {elapsed:.1f}s")
-    return rows, elapsed
+def pairwise_mcnemar(raw_by_bin, learned_arms, exp_key):
+    # Every pair of learned arms, per bin. The expert is a ceiling, not a competitor.
+    out = []
+    for label, raw in raw_by_bin.items():
+        for a, b in itertools.combinations(learned_arms, 2):
+            b_cnt, c_cnt, p = mcnemar(raw[a], raw[b])
+            out.append({"experiment": exp_key, "bin_label": label, "arm_a": a, "arm_b": b,
+                        "b_a_only": b_cnt, "c_b_only": c_cnt, "p_value": p})
+    return out
 
 
-# --------------------------------------------------------------------------- #
-# output
-# --------------------------------------------------------------------------- #
+def print_experiment(rows, mcnemar_rows, arms, bins):
+    for _, label, _ in bins:
+        rates = {r["arm"]: r["success_rate"] for r in rows if r["bin_label"] == label}
+        print(f"  {label:<10}" + " | ".join(f"{a}={rates[a]:.1%}" for a in arms))
+    for m in mcnemar_rows:
+        print(f"    [{m['bin_label']}] {m['arm_a']} vs {m['arm_b']}: "
+              f"b={m['b_a_only']} c={m['c_b_only']} p={m['p_value']:.4g}")
+
+
 CSV_FIELDS = ["experiment", "bin_label", "bin_value", "arm", "episodes", "successes",
               "success_rate", "wilson_lo", "wilson_hi", "n_failures", "fail_dist_mean",
-              "fail_dist_median", "scenes_rejected", "mcnemar_b", "mcnemar_c", "mcnemar_p"]
+              "fail_dist_median", "scenes_rejected"]
+MCNEMAR_FIELDS = ["experiment", "bin_label", "arm_a", "arm_b", "b_a_only", "c_b_only", "p_value"]
 
 
-def write_csv(rows, path):
+def write_csv(rows, fields, path):
     with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"\n[out] wrote {path} ({len(rows)} rows)")
+    print(f"[out] wrote {path} ({len(rows)} rows)")
 
 
-def _sweep_plot(rows, experiment, xlabel, title, boundaries, path, legend_loc="lower left"):
+def read_csv(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        return [{**r, "bin_value": float(r["bin_value"]),
+                 "success_rate": float(r["success_rate"]),
+                 "wilson_lo": float(r["wilson_lo"]), "wilson_hi": float(r["wilson_hi"])}
+                for r in csv.DictReader(fh)]
+
+
+def sweep_plot(rows, arms, styles, experiment, xlabel, title, boundaries, path,
+               legend_loc="lower left"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -584,18 +548,19 @@ def _sweep_plot(rows, experiment, xlabel, title, boundaries, path, legend_loc="l
         ax.annotate(label, xy=(x, 1.09 + 0.08 * row), ha="center", va="bottom",
                     fontsize=7.5, color=colour, annotation_clip=False)
 
-    for arm in ARMS:
+    for arm in arms:
         sel = [r for r in rows if r["experiment"] == experiment and r["arm"] == arm]
         xs = np.array([r["bin_value"] for r in sel])
         ys = np.array([r["success_rate"] for r in sel])
         lo = np.maximum(ys - np.array([r["wilson_lo"] for r in sel]), 0.0)
         hi = np.maximum(np.array([r["wilson_hi"] for r in sel]) - ys, 0.0)
-        is_expert = arm == "expert"
+        colour, marker = styles[arm]
+        is_expert = arm == EXPERT
         name = "scripted expert (feasibility ceiling)" if is_expert else arm
-        ax.errorbar(xs, ys, yerr=[lo, hi], color=ARM_COLOUR[arm], lw=2.0,
-                    ls="--" if is_expert else "-", marker=ARM_MARKER[arm], ms=7,
+        ax.errorbar(xs, ys, yerr=[lo, hi], color=colour, lw=2.0,
+                    ls="--" if is_expert else "-", marker=marker, ms=7,
                     mec=SURFACE, mew=1.5, capsize=3.5, elinewidth=1.4,
-                    label=name, zorder=4 if not is_expert else 3)
+                    label=name, zorder=3 if is_expert else 4)
 
     ax.set_xlabel(xlabel, color=INK, fontsize=10)
     ax.set_ylabel("success rate", color=INK, fontsize=10)
@@ -620,21 +585,23 @@ def _sweep_plot(rows, experiment, xlabel, title, boundaries, path, legend_loc="l
     print(f"[out] wrote {path}")
 
 
-def make_plots(rows):
-    _sweep_plot(
-        rows, "exp2",
+def make_plots(rows, arms, suffix, title_suffix):
+    tag = f"_{suffix}" if suffix else ""
+    styles = arm_styles(arms)
+    sweep_plot(
+        rows, arms, styles, "exp2",
         "distance of object and goal from table centre, r (m)",
-        "OOD generalisation vs radial distance — PandaPickAndPlace-v3",
+        f"OOD generalisation vs radial distance — {title_suffix}",
         [(0.15, "edge of training square (r=0.15)", "#008300"),
          (0.2121, "fully outside support (r=0.212)", "#d03b3b")],
-        "ood_radius.png",
+        f"ood_radius{tag}.png",
     )
-    _sweep_plot(
-        rows, "exp3",
+    sweep_plot(
+        rows, arms, styles, "exp3",
         "goal height above table, z (m)   [xy fixed at r=0.10]",
-        "OOD generalisation vs goal height — PandaPickAndPlace-v3",
+        f"OOD generalisation vs goal height — {title_suffix}",
         [(TRAIN_Z_CEILING, f"training ceiling (z={TRAIN_Z_CEILING:.2f})", "#d03b3b")],
-        "ood_height.png",
+        f"ood_height{tag}.png",
         legend_loc="center",   # SAC sits flat on 0% and BC on ~100%: the middle is empty
     )
 
@@ -662,34 +629,37 @@ def describe_setup(device):
     return lines
 
 
-# --------------------------------------------------------------------------- #
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bc-dir", default=f"models/BC_{ENV_ID}")
-    parser.add_argument("--bc-checkpoint", default="95_best")
-    parser.add_argument("--sac-dir", default=f"models/SAC_{ENV_ID}")
-    parser.add_argument("--sac-checkpoint", default="291904_interrupted")
-    parser.add_argument("--episodes", type=int, default=100, help="Episodes/bin for BC and SAC")
+    parser.add_argument("--arm", action="append", nargs=3, metavar=("NAME", "DIR", "CHECKPOINT"),
+                        help="Learned arm to evaluate, repeat once per arm. "
+                             f"Default: {' and '.join(n for n, _, _ in DEFAULT_ARMS)}")
+    parser.add_argument("--episodes", type=int, default=100, help="Episodes/bin for the learned arms")
     parser.add_argument("--expert-episodes", type=int, default=50, help="Episodes/bin for the expert control")
     parser.add_argument("--exp1-episodes", type=int, default=200, help="Episodes for experiment 1 (all arms)")
     parser.add_argument("--probe-episodes", type=int, default=10, help="Episodes/bin for the sanity expert probe")
     parser.add_argument("--scenes", default="ood_scenes.npz")
+    parser.add_argument("--regen-scenes", action="store_true", help="Rebuild the scene table even if --scenes exists")
     parser.add_argument("--csv", default="ood_results.csv")
+    parser.add_argument("--mcnemar-csv", default="ood_mcnemar.csv")
+    parser.add_argument("--plot-suffix", default="", help="Plots go to ood_radius_<suffix>.png / "
+                                                          "ood_height_<suffix>.png, so repeat runs don't overwrite each other")
+    parser.add_argument("--plot-title-suffix", default=ENV_ID, help="Trailing half of the plot titles")
     parser.add_argument("--replot", action="store_true", help="Redraw the plots from an existing --csv and exit")
     parser.add_argument("--sanity", action="store_true", help="Run sanity checks only and exit")
     parser.add_argument("--skip-sanity", action="store_true", help="Go straight to the experiments")
     args = parser.parse_args()
 
     total_started = time.perf_counter()
+    arm_specs = [tuple(a) for a in args.arm] if args.arm else DEFAULT_ARMS
+    learned_arms = [name for name, _, _ in arm_specs]
+    arms = learned_arms + [EXPERT]
 
     if args.replot:
-        with open(args.csv, newline="", encoding="utf-8") as fh:
-            rows = [{**r, "bin_value": float(r["bin_value"]),
-                     "success_rate": float(r["success_rate"]),
-                     "wilson_lo": float(r["wilson_lo"]), "wilson_hi": float(r["wilson_hi"])}
-                    for r in csv.DictReader(fh)]
-        make_plots(rows)
+        rows = read_csv(args.csv)
+        seen = list(dict.fromkeys(r["arm"] for r in rows))   # arm order as written
+        make_plots(rows, seen, args.plot_suffix, args.plot_title_suffix)
         return 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -702,18 +672,11 @@ def main():
     print("\n" + "=" * 78)
     print("SCENE TABLE")
     print("=" * 78)
-    table, rejects = build_scene_table(args.exp1_episodes, args.episodes)
-    save_scenes(table, args.scenes)
-    total_scenes = args.exp1_episodes + args.episodes * (len(RADII) + len(GOAL_ZS))
-    print(f"  rng            np.random.default_rng({SCENE_RNG_SEED})")
-    print(f"  arc            [{np.rad2deg(THETA_LO):.1f}, {np.rad2deg(THETA_HI):.1f}] deg "
-          f"({np.rad2deg(THETA_HI - THETA_LO):.1f} deg wide)")
-    print(f"  scenes         {total_scenes} across {1 + len(RADII) + len(GOAL_ZS)} bins")
-    print(f"  rejected       {sum(rejects.values())} (initial separation < {MIN_SEPARATION} m)")
-    print(f"  archived to    {args.scenes}")
+    table, rejects = get_scene_table(args.scenes, args.exp1_episodes, args.episodes, args.regen_scenes)
+    check_scene_counts(table, args.episodes, args.exp1_episodes)
 
     if not args.skip_sanity:
-        ok, _, low = sanity(table, rejects, args.probe_episodes)
+        ok, low = sanity(table, rejects, args.scenes, args.probe_episodes)
         if low:
             print("\nHALTING: the scripted expert is below 80% in the bins listed above.")
             print("A low expert score means those scenes are physically infeasible and the")
@@ -733,30 +696,63 @@ def main():
                + probe_env.observation_space["desired_goal"].shape[0])
     act_dim = probe_env.action_space.shape[0]
     probe_env.close()
-    print("BC")
-    bc_actor, bc_norm = load_actor(args.bc_dir, args.bc_checkpoint, obs_dim, act_dim, device)
-    print("SAC+HER")
-    sac_actor, sac_norm = load_actor(args.sac_dir, args.sac_checkpoint, obs_dim, act_dim, device)
-    policies = {
-        "BC": NetPolicy(bc_actor, bc_norm, device),
-        "SAC+HER": NetPolicy(sac_actor, sac_norm, device),
-        "expert": ExpertPolicy(),
-    }
+    policies = build_policies(arm_specs, obs_dim, act_dim, device)
 
-    rows = []
-    r1, t1 = experiment_1(table, rejects, policies, args.exp1_episodes)
-    rows += r1
-    r2, t2 = experiment_2(table, rejects, policies, args.episodes, args.expert_episodes)
-    rows += r2
-    r3, t3 = experiment_3(table, rejects, policies, args.episodes, args.expert_episodes)
-    rows += r3
+    all_rows, all_mcnemar, elapsed = [], [], {}
 
-    write_csv(rows, args.csv)
-    make_plots(rows)
+    print("\n" + "=" * 78)
+    print("EXPERIMENT 1 -- default panda-gym distribution")
+    print("=" * 78)
+    started = time.perf_counter()
+    bins = [("exp1", "default", float("nan"))]
+    rows, raw = run_experiment(table, rejects, policies, arms, "exp1", bins,
+                               args.exp1_episodes, args.exp1_episodes, default_sampling=True)
+    mc = pairwise_mcnemar(raw, learned_arms, "exp1")
+    elapsed["exp1"] = time.perf_counter() - started
+    all_rows += rows
+    all_mcnemar += mc
+    for r in rows:
+        print(f"  {r['arm']:<26}{r['success_rate']:>7.1%}  [{r['wilson_lo']:.2f}, {r['wilson_hi']:.2f}]")
+    for m in mc:
+        print(f"  McNemar {m['arm_a']} vs {m['arm_b']}: b={m['b_a_only']} c={m['c_b_only']} p={m['p_value']:.4g}")
+    print(f"  elapsed {elapsed['exp1']:.1f}s")
+
+    print("\n" + "=" * 78)
+    print("EXPERIMENT 2 -- radius sweep (object and goal on a ring)")
+    print("=" * 78)
+    started = time.perf_counter()
+    bins = [(f"exp2_r{r:.2f}", f"r={r:.2f}", r) for r in RADII]
+    rows, raw = run_experiment(table, rejects, policies, arms, "exp2", bins,
+                               args.episodes, args.expert_episodes)
+    mc = pairwise_mcnemar(raw, learned_arms, "exp2")
+    elapsed["exp2"] = time.perf_counter() - started
+    all_rows += rows
+    all_mcnemar += mc
+    print_experiment(rows, mc, arms, bins)
+    print(f"  elapsed {elapsed['exp2']:.1f}s")
+
+    print("\n" + "=" * 78)
+    print(f"EXPERIMENT 3 -- goal height sweep (xy fixed at r={HEIGHT_SWEEP_RADIUS:.2f})")
+    print("=" * 78)
+    started = time.perf_counter()
+    bins = [(f"exp3_z{z:.2f}", f"z={z:.2f}", z) for z in GOAL_ZS]
+    rows, raw = run_experiment(table, rejects, policies, arms, "exp3", bins,
+                               args.episodes, args.expert_episodes)
+    mc = pairwise_mcnemar(raw, learned_arms, "exp3")
+    elapsed["exp3"] = time.perf_counter() - started
+    all_rows += rows
+    all_mcnemar += mc
+    print_experiment(rows, mc, arms, bins)
+    print(f"  elapsed {elapsed['exp3']:.1f}s")
+
+    print()
+    write_csv(all_rows, CSV_FIELDS, args.csv)
+    write_csv(all_mcnemar, MCNEMAR_FIELDS, args.mcnemar_csv)
+    make_plots(all_rows, arms, args.plot_suffix, args.plot_title_suffix)
 
     total = time.perf_counter() - total_started
-    print(f"\n[time] exp1 {t1:.1f}s | exp2 {t2:.1f}s | exp3 {t3:.1f}s | total {total:.1f}s "
-          f"({total / 60:.1f} min)")
+    print(f"\n[time] exp1 {elapsed['exp1']:.1f}s | exp2 {elapsed['exp2']:.1f}s | "
+          f"exp3 {elapsed['exp3']:.1f}s | total {total:.1f}s ({total / 60:.1f} min)")
     return 0
 
 

@@ -1,29 +1,3 @@
-"""
-SAC + HER agent adapted to panda-gym's `PandaPickAndPlace-v3` (a Gymnasium goal env).
-
-This is an INTERFACE port of SAC_agent_HER.py. The SAC update rules
-(`update_critic`, `update_actor`, alpha tuning) and the HER *strategy*
-(80% future-relabel, episode-length-weighted sampling, transition-capped
-episodic buffer) are copied unchanged from SAC_agent_HER.py. Only the code that
-touches the environment differs, and every such difference is marked with a
-`# [PANDA]` comment so it can be diffed against the original:
-
-  * observation is now Dict{observation, achieved_goal, desired_goal}; the policy
-    input is concat(observation, desired_goal). `achieved_goal` is used ONLY for
-    HER relabeling + reward, never fed to a network.
-  * reward for relabeled transitions comes from a dedicated reference env's
-    `compute_reward` (vectorized over the minibatch) -- the sparse reward is NOT
-    reimplemented here.
-  * episodes are fully NON-TERMINAL: panda-gym `terminated` is always False and
-    episodes end by truncation at 50 steps, so stored `done` is always 0.
-  * the env uses Gymnasium 1.x `AutoresetMode.NEXT_STEP`: the terminal obs is
-    returned inline on the truncating step, and the FOLLOWING step is a throwaway
-    reset step (ignored action / placeholder reward) that must be skipped. There
-    is no `final_observation` info key under this autoreset mode.
-
-The original camera/CNN-encoder path is intentionally dropped (panda obs has no
-image). SAC_agent_HER.py and the custom stacking env are left untouched.
-"""
 import os
 import datetime
 import time
@@ -308,15 +282,6 @@ class SACAgent():
         return obs_inputs, actions, rewards, next_obs_inputs, dones
 
     def load_demonstrations(self, demo_path):
-        """Seed the replay buffer with recorded expert episodes before training starts.
-
-        HER relabels goals onto achieved object positions, so while the cube is static
-        almost every relabeled goal is already satisfied and carries no gradient. Demos
-        are the cheapest source of transitions where the cube actually leaves the table,
-        which is what lets HER generate airborne relabeled goals at all.
-
-        Expects the layout scripted_expert.py --record writes (expert_demos.npz).
-        """
         with np.load(demo_path) as data:
             observation = data["observation"]
             next_observation = data["next_observation"]
@@ -328,7 +293,7 @@ class SACAgent():
 
         episodes = 0
         for ep in np.unique(episode_index):
-            indices = np.flatnonzero(episode_index == ep)   # already in time order
+            indices = np.flatnonzero(episode_index == ep)   # dta already in timestep order
             self.replay_buffer.add_episode([
                 StepInfo(
                     observation=observation[i],
@@ -337,7 +302,7 @@ class SACAgent():
                     next_observation=next_observation[i],
                     next_achieved_goal=next_achieved_goal[i],
                     desired_goal=desired_goal[i],
-                    done=np.float32(0.0),  # [PANDA] non-terminal, same convention as online data
+                    done=np.float32(0.0),  
                 )
                 for i in indices
             ])
@@ -382,7 +347,7 @@ class SACAgent():
 
         print(f"Loaded checkpoint at timestep {timestep}")
 
-    def train(self, model_path, save_timesteps=50000, start_timestep=0, debug_boundary=False, target_success_rate=0.80):
+    def train(self, model_path, save_timesteps=50000, start_timestep=0, target_success_rate=0.80):
         actor_dir = os.path.join(model_path, "Actor")
         critic_dir = os.path.join(model_path, "Critic")
         alpha_dir = os.path.join(model_path, "Alpha")
